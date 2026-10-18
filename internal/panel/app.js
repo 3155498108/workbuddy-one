@@ -1,6 +1,17 @@
 'use strict';
 /* ── 状态 ─────────────────────────────────────────────────────────── */
 const LS_KEY = 'wb2api.key', LS_THEME = 'wb2api.theme';
+/* 桌面壳引导：URL 片段带 #key=xxx 时写入 localStorage 并立刻抹掉片段，
+ * 让双击启动的桌面程序免去手工粘贴密钥这一步。
+ * 用片段而非查询串：hash 不会进服务端日志，replaceState 后也不留在地址栏。 */
+(function bootstrapKeyFromHash() {
+  try {
+    const m = /(?:^#|&)key=([^&]+)/.exec(location.hash || '');
+    if (!m) return;
+    localStorage.setItem(LS_KEY, decodeURIComponent(m[1]));
+    history.replaceState(null, '', location.pathname + location.search);
+  } catch (e) { /* 无痕/受限环境忽略 */ }
+})();
 let theme = localStorage.getItem(LS_THEME) || 'auto';   // auto | light | dark
 let view = 'accounts';
 let overviewData = null, cfgLoaded = null;

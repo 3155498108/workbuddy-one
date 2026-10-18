@@ -32,7 +32,7 @@ func TestSecurityHeadersOnAllPanelResponses(t *testing.T) {
 		if h.Get("X-Content-Type-Options") != "nosniff" {
 			t.Errorf("%s %s: X-Content-Type-Options=%q", c.method, c.path, h.Get("X-Content-Type-Options"))
 		}
-		if h.Get("X-Frame-Options") != "DENY" {
+		if h.Get("X-Frame-Options") != "SAMEORIGIN" {
 			t.Errorf("%s %s: X-Frame-Options=%q", c.method, c.path, h.Get("X-Frame-Options"))
 		}
 		if h.Get("Referrer-Policy") != "no-referrer" {
@@ -50,7 +50,7 @@ func TestCSPDisallowsInlineScriptAndFraming(t *testing.T) {
 
 	for _, must := range []string{
 		"script-src 'self'",
-		"frame-ancestors 'none'",
+		"frame-ancestors 'self'",
 		"base-uri 'none'",
 		"default-src 'none'",
 	} {

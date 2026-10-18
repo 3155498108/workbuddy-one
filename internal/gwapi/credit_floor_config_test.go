@@ -1,6 +1,6 @@
 // credit_floor_config_test.go pool.credit_floor 配置测试：
 // 默认 0（关闭，零回归）/ 文件覆盖 / 负值钳 0 / 大值合法。
-package main
+package gwapi
 
 import (
 	"os"

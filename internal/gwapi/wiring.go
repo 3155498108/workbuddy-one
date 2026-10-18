@@ -1,4 +1,4 @@
-package main
+package gwapi
 
 import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"

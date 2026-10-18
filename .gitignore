@@ -34,6 +34,7 @@ docs/
 # 设计/计划文档（但 README.md 必须进版本库）
 *.md
 !README.md
+!README.upstream.md
 
 # Windows binaries
 /wb2api.exe
@@ -45,3 +46,10 @@ docs/
 *.zip
 server.exe
 .DS_Store
+
+# 本仓库额外的本地产物
+*.log
+/wbone.exe
+
+# 本地构建输出（含 exe 与调试截图，不进版本库）
+/dist/

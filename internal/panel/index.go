@@ -28,17 +28,18 @@ var appJS []byte
 //   - connect-src 'self'        前端 fetch 只能打本服务
 //   - img-src 'self' data:      图标/内联图
 //   - form-action 'none'        页面无表单提交目标（配置页是 JS 提交）
-//   - frame-ancestors 'none'    禁止被任何站点 iframe 嵌套（点击劫持）
+//   - frame-ancestors 'self'    只允许同源页面 iframe 嵌套（点击劫持防护不变：
+//     外部站点仍然嵌不了，同源嵌套是 WorkBuddy 管家统一界面的需要）
 //   - base-uri 'none'          禁止注入 <base> 改写相对路径
 const csp = "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; " +
 	"connect-src 'self'; img-src 'self' data:; form-action 'none'; " +
-	"frame-ancestors 'none'; base-uri 'none'"
+	"frame-ancestors 'self'; base-uri 'none'"
 
 // setSecurityHeaders 写入面板统一安全响应头（页面与 API 都要，API 也含 JSON 数据）。
 func setSecurityHeaders(w http.ResponseWriter) {
 	w.Header().Set("Content-Security-Policy", csp)
 	w.Header().Set("X-Content-Type-Options", "nosniff") // 禁 MIME 嗅探
-	w.Header().Set("X-Frame-Options", "DENY")           // 老浏览器兜底（CSP frame-ancestors 的等价项）
+	w.Header().Set("X-Frame-Options", "SAMEORIGIN")     // 老浏览器兜底（与 frame-ancestors 'self' 等价）
 	w.Header().Set("Referrer-Policy", "no-referrer")    // 不外泄面板地址给外部站点
 	w.Header().Set("Cross-Origin-Opener-Policy", "same-origin")
 	w.Header().Set("Cross-Origin-Resource-Policy", "same-origin")

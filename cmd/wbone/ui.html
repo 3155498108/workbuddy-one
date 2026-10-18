@@ -1,0 +1,659 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>WorkBuddy 管家</title>
+<style>
+  :root{
+    --bg:#f4f6f9; --card:#ffffff; --line:#e5e8ee; --text:#16181d; --sub:#6b7280;
+    --accent:#2f6fed; --accent-soft:#eaf1ff; --ok:#0f9d58; --warn:#b45309; --danger:#c0392b;
+  }
+  *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+  html,body{height:100%}
+  body{
+    margin:0;background:var(--bg);color:var(--text);overflow:hidden;
+    font-family:"Microsoft YaHei UI","Microsoft YaHei","PingFang SC",system-ui,sans-serif;
+    font-size:13.5px;line-height:1.5;
+  }
+  .app{display:flex;height:100%}
+
+  /* ── 侧栏 ─────────────────────── */
+  .side{
+    width:196px;flex:0 0 196px;background:#fff;border-right:1px solid var(--line);
+    display:flex;flex-direction:column;padding:16px 12px 12px;
+  }
+  .brand{display:flex;align-items:center;gap:9px;padding:2px 6px 16px}
+  .logo{
+    width:29px;height:29px;border-radius:9px;display:grid;place-items:center;flex:0 0 29px;
+    background:linear-gradient(145deg,#3b7bf6,#2456c9);color:#fff;
+  }
+  .brand b{font-size:14px;font-weight:650;letter-spacing:.2px}
+  .brand small{display:block;font-size:11px;color:var(--sub);font-weight:400;margin-top:1px}
+  nav{display:flex;flex-direction:column;gap:3px;margin-top:2px}
+  .nav{
+    display:flex;align-items:center;gap:9px;padding:8px 10px;border-radius:9px;border:1px solid transparent;
+    background:transparent;color:#3d434d;font-family:inherit;font-size:13px;cursor:pointer;text-align:left;
+    transition:background .14s,color .14s;
+  }
+  .nav svg{width:15px;height:15px;flex:0 0 15px;opacity:.72}
+  .nav:hover{background:#f4f6fa;color:var(--text)}
+  .nav.on{background:var(--accent-soft);color:#1d4ed8;font-weight:600}
+  .nav.on svg{opacity:1}
+  .nav .badge{
+    margin-left:auto;font-size:11px;padding:0 6px;height:17px;line-height:17px;border-radius:6px;
+    background:#eef1f6;color:#5b6270;font-weight:500;
+  }
+  .nav.on .badge{background:#dbe7ff;color:#1d4ed8}
+  .side-foot{margin-top:auto;font-size:11.5px;color:#9aa1ad;padding:8px 8px 2px;line-height:1.65;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .side-foot .dot{display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--ok);margin-right:5px;vertical-align:1px}
+  .side-foot .dot.off{background:#c2c7d0}
+
+  /* 面板视图：侧栏收成图标条，把宽度让给 iframe（两层侧栏并排太挤） */
+  body.compact .side{width:58px;flex-basis:58px;padding:16px 8px 12px}
+  body.compact .brand{justify-content:center;padding:2px 0 16px}
+  body.compact .brand b,body.compact .brand small,
+  body.compact .nav .t,body.compact .nav .badge,body.compact .side-foot{display:none}
+  body.compact .nav{justify-content:center;padding:9px 0}
+  body.compact .nav svg{width:16px;height:16px}
+
+  /* ── 主区 ─────────────────────── */
+  .main{flex:1;min-width:0;display:flex;flex-direction:column;position:relative}
+  .view{display:none;flex:1;min-height:0;flex-direction:column}
+  .view.on{display:flex}
+
+  /* 账号页 */
+  .scroll{flex:1;min-height:0;overflow:auto;padding:22px 26px 18px}
+  .head{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;margin-bottom:16px}
+  h2{font-size:17px;margin:0 0 3px;font-weight:650;letter-spacing:.2px}
+  .head p{margin:0;color:var(--sub);font-size:12.5px}
+  .pills{display:flex;flex-direction:column;gap:5px;align-items:flex-end}
+  .pill{
+    display:inline-flex;align-items:center;gap:6px;padding:3px 10px;border-radius:999px;
+    background:var(--accent-soft);color:#1d4ed8;font-size:12px;white-space:nowrap;
+  }
+  .pill .dot{width:6px;height:6px;border-radius:50%;background:currentColor;opacity:.85}
+
+  .tiles{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:16px}
+  .tile{background:#fff;border:1px solid var(--line);border-radius:11px;padding:10px 13px}
+  .tile .k{font-size:11.5px;color:var(--sub);margin-bottom:2px}
+  .tile .v{font-size:15px;font-weight:650;letter-spacing:.2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .tile .v small{font-size:11.5px;font-weight:400;color:var(--sub);margin-left:4px}
+
+  .note{
+    display:flex;gap:8px;align-items:flex-start;background:#fff9ed;border:1px solid #f5e4bf;
+    color:#8a6212;border-radius:10px;padding:9px 11px;font-size:12px;margin-bottom:14px;line-height:1.55;
+  }
+  .note b{color:#7a5310}
+
+  .list{display:flex;flex-direction:column;gap:9px;min-height:80px}
+
+  /* 对话同步 */
+  .syncbox{
+    display:flex;align-items:center;gap:14px;margin-top:14px;background:#fff;
+    border:1px solid var(--line);border-radius:12px;padding:12px 15px;
+  }
+  .syncbox.on{border-color:#bfd3f8;background:linear-gradient(0deg,#fbfdff,#fff)}
+  .syncmain{flex:1;min-width:0}
+  .synctitle{font-size:13px;font-weight:650;display:flex;align-items:center;gap:7px}
+  .synctitle .tag{font-size:11px;font-weight:500;color:#5b6270;background:#eef1f6;border-radius:6px;padding:1px 7px}
+  .syncbox.on .synctitle .tag{background:#dbe7ff;color:#1d4ed8}
+  .syncdesc{font-size:12px;color:var(--sub);margin-top:3px;line-height:1.55}
+  .syncact{display:flex;align-items:center;gap:10px;flex:0 0 auto}
+  .sw{position:relative;display:inline-block;width:38px;height:21px;flex:0 0 38px;cursor:pointer}
+  .sw input{opacity:0;width:0;height:0;position:absolute}
+  .sw i{position:absolute;inset:0;background:#d5dae2;border-radius:999px;transition:background .18s}
+  .sw i::after{
+    content:"";position:absolute;left:2px;top:2px;width:17px;height:17px;border-radius:50%;
+    background:#fff;transition:transform .18s;box-shadow:0 1px 2px rgba(0,0,0,.18);
+  }
+  .sw input:checked + i{background:var(--accent)}
+  .sw input:checked + i::after{transform:translateX(17px)}
+  .card{
+    display:flex;align-items:center;gap:13px;background:#fff;border:1px solid var(--line);
+    border-radius:12px;padding:12px 15px;transition:border-color .15s,box-shadow .15s;
+  }
+  .card:hover{border-color:#c8d5f2;box-shadow:0 3px 12px rgba(31,41,55,.055)}
+  .card.cur{border-color:#bfd3f8;background:linear-gradient(0deg,#fbfdff,#fff)}
+  .avatar{
+    width:40px;height:40px;flex:0 0 40px;border-radius:11px;display:grid;place-items:center;
+    background:var(--accent-soft);color:#1d4ed8;font-weight:650;font-size:14px;
+  }
+  .card.cur .avatar{background:#e6f8ee;color:#0b8a45}
+  .meta{flex:1;min-width:0}
+  .name{font-weight:650;display:flex;align-items:center;gap:7px;font-size:14px;flex-wrap:wrap}
+  .tag{font-weight:500;font-size:11px;padding:1px 6px;border-radius:5px;border:1px solid transparent}
+  .tag.cur{background:#e6f8ee;color:#0b8a45;border-color:#c6eed7}
+  .tag.line{background:#f3f5f8;color:#4b5563;border-color:#e6e8ec}
+  .tag.credit{background:#f6f2ff;color:#6b46c1;border-color:#e6dcfb}
+  .edit{
+    border:none;background:transparent;color:#b8bec9;font-size:12px;cursor:pointer;padding:1px 3px;
+    border-radius:4px;line-height:1;font-family:inherit;
+  }
+  .edit:hover{background:#eef1f5;color:#4b5563}
+  .id{color:var(--sub);font-size:11.5px;margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  button{
+    font-family:inherit;font-size:12.5px;border-radius:8px;border:1px solid var(--line);
+    background:#fff;color:var(--text);padding:6px 13px;cursor:pointer;transition:.14s;white-space:nowrap;
+  }
+  button:hover{background:#f7f8fa;border-color:#d3d7de}
+  button:active{transform:translateY(1px)}
+  button:disabled{opacity:.45;cursor:not-allowed;transform:none}
+  button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+  button.primary:hover{background:#255fd8;border-color:#255fd8}
+  button.ghost{background:transparent;border-color:transparent;color:var(--sub)}
+  button.ghost:hover{background:#eceff3;color:var(--text)}
+  .empty{
+    border:1px dashed var(--line);border-radius:12px;padding:24px 18px;text-align:center;
+    color:var(--sub);font-size:12.5px;background:#fafbfc;
+  }
+  .empty b{color:var(--text);display:block;margin-bottom:4px;font-size:13.5px;font-weight:650}
+  .toolbar{
+    display:flex;align-items:center;gap:8px;padding:11px 26px;border-top:1px solid var(--line);
+    background:#fff;
+  }
+  .spacer{flex:1}
+  .hint{font-size:11.5px;color:var(--sub)}
+
+  /* 面板页 */
+  .panelbar{
+    display:flex;align-items:center;gap:10px;padding:9px 14px;border-bottom:1px solid var(--line);
+    background:#fff;font-size:12px;color:var(--sub);flex:0 0 auto;
+  }
+  .panelbar .kv{display:flex;align-items:center;gap:6px;min-width:0}
+  .panelbar code{
+    font-family:Consolas,ui-monospace,monospace;font-size:12px;color:#1f2430;background:#f4f6f9;
+    text-decoration:none;
+    border:1px solid var(--line);border-radius:6px;padding:2px 7px;white-space:nowrap;
+    overflow:hidden;text-overflow:ellipsis;max-width:430px;
+  }
+  .panelbar .copy{
+    padding:3px 9px;font-size:11.5px;border-radius:6px;
+  }
+  iframe{flex:1;width:100%;border:0;background:#fff;min-height:0}
+
+  #toast{
+    position:fixed;left:50%;bottom:22px;transform:translate(-50%,14px);opacity:0;pointer-events:none;
+    background:rgba(24,30,40,.94);color:#fff;padding:9px 17px;border-radius:9px;font-size:12.5px;
+    transition:opacity .18s,transform .18s;max-width:70%;text-align:center;box-shadow:0 8px 24px rgba(0,0,0,.18);z-index:9;
+  }
+  #toast.show{opacity:1;transform:translate(-50%,0)}
+  #toast.err{background:#c0392b}
+  .spin{display:inline-block;width:12px;height:12px;border:2px solid rgba(255,255,255,.5);
+    border-top-color:#fff;border-radius:50%;animation:sp .7s linear infinite;vertical-align:-2px;margin-right:6px}
+  @keyframes sp{to{transform:rotate(360deg)}}
+</style>
+</head>
+<body>
+<div class="app">
+  <aside class="side">
+    <div class="brand">
+      <div class="logo">
+        <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M4 7.5 12 3l8 4.5v9L12 21l-8-4.5z"/><path d="M12 12v9"/><path d="M4 7.5 12 12l8-4.5"/>
+        </svg>
+      </div>
+      <div>
+        <b>WorkBuddy 管家</b>
+        <small>账号切换 · API 面板</small>
+      </div>
+    </div>
+
+    <nav>
+      <button class="nav on" data-view="accounts">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="12" cy="8" r="3.6"/><path d="M4.5 20a7.5 7.5 0 0 1 15 0"/>
+        </svg>
+        <span class="t">账号切换</span>
+        <span class="badge" id="navAcc">0</span>
+      </button>
+      <button class="nav" data-view="panel">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <rect x="3.5" y="4" width="17" height="16" rx="2.4"/><path d="M3.5 9.5h17"/><path d="M9 9.5V20"/>
+        </svg>
+        <span class="t">API 面板</span>
+      </button>
+    </nav>
+
+    <div class="side-foot">
+      <div><span class="dot" id="gwDot"></span><span id="gwText">服务启动中</span></div>
+      <div id="gwSub"></div>
+    </div>
+  </aside>
+
+  <main class="main">
+    <section class="view on" id="view-accounts">
+      <div class="scroll">
+        <div class="head">
+          <div>
+            <h2>账号切换</h2>
+            <p>一键换掉客户端登录账号，不用退出登录重来一遍。</p>
+          </div>
+          <div class="pills" id="pills"><div class="pill"><span class="dot"></span><span>读取中</span></div></div>
+        </div>
+
+        <div class="tiles">
+          <div class="tile"><div class="k">当前账号</div><div class="v" id="tCur">—</div></div>
+          <div class="tile"><div class="k">已保存账号</div><div class="v" id="tSaved">0</div></div>
+          <div class="tile"><div class="k">客户端</div><div class="v" id="tClient">—</div></div>
+          <div class="tile"><div class="k">API 池账号</div><div class="v" id="tPool">—<small id="tPoolSub"></small></div></div>
+        </div>
+
+        <div class="note">
+          <div>!</div>
+          <div>切换会替换客户端的登录凭据并<b>自动重启 WorkBuddy</b>，当前对话窗口会被关闭；重新打开后就是新账号。积分来自 API 面板的账号池，仅对已导入面板的账号显示。</div>
+        </div>
+
+        <div class="list" id="list"></div>
+
+        <div class="syncbox" id="syncBox">
+          <div class="syncmain">
+            <div class="synctitle">对话同步 <span class="tag" id="syncTag">读取中</span></div>
+            <div class="syncdesc" id="syncDesc">所有账号共用同一份本地对话历史</div>
+          </div>
+          <div class="syncact">
+            <button class="ghost" id="btnSyncNow">立即同步</button>
+            <label class="sw" title="切换账号时自动把历史对话带过去">
+              <input type="checkbox" id="swSync"><i></i>
+            </label>
+          </div>
+        </div>
+      </div>
+      <div class="toolbar">
+        <button id="btnSave" class="primary">保存当前登录</button>
+        <button id="btnRestart">重启客户端</button>
+        <div class="spacer"></div>
+        <span class="hint" id="hint"></span>
+        <button class="ghost" id="btnReload">刷新</button>
+        <button class="ghost" id="btnQuit">退出管家</button>
+      </div>
+    </section>
+
+    <section class="view" id="view-panel">
+      <div class="panelbar">
+        <div class="kv">
+          <span>接口地址</span>
+          <code id="apiBase">—</code>
+          <button class="copy" id="copyBase">复制</button>
+        </div>
+        <div class="kv">
+          <span>密钥</span>
+          <code id="apiKey">—</code>
+          <button class="copy" id="copyKey">复制</button>
+        </div>
+        <div class="spacer"></div>
+        <button class="ghost" id="btnReloadPanel">重载面板</button>
+      </div>
+      <iframe id="panelFrame" title="API 面板"></iframe>
+    </section>
+  </main>
+</div>
+<div id="toast"></div>
+
+<script>
+const API_KEY = "{{API_KEY}}";
+const $ = s => document.querySelector(s);
+let state = { accounts: [], current: [], running: false };
+let pool = null;          // /panel/api/overview 结果
+let busy = false;
+let panelLoaded = false;
+
+function toast(msg, isErr) {
+  const t = $("#toast");
+  t.textContent = msg;
+  t.className = "show" + (isErr ? " err" : "");
+  clearTimeout(t._t);
+  t._t = setTimeout(() => { t.className = ""; }, isErr ? 4500 : 2600);
+}
+
+async function api(path, body) {
+  const opt = body === undefined
+    ? { method: "GET" }
+    : { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) };
+  const r = await fetch(path + "?t=" + Date.now(), opt);
+  const d = await r.json().catch(() => ({ ok: false, error: "返回内容无法解析" }));
+  if (!r.ok || d.ok === false) throw new Error(d.error || ("HTTP " + r.status));
+  return d;
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+function initials(name) {
+  const n = (name || "?").trim();
+  if (/^[\u4e00-\u9fa5]/.test(n)) return n.slice(-2);
+  if (n.includes("@")) return n.slice(0, 1).toUpperCase();
+  return n.slice(0, 1).toUpperCase();
+}
+function fmtDate(s) {
+  if (!s) return "";
+  const d = new Date(s);
+  if (isNaN(d)) return "";
+  const p = x => String(x).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+function fmtNum(n) {
+  if (n === undefined || n === null) return "";
+  if (n >= 10000) return (n / 10000).toFixed(1) + "万";
+  return String(n);
+}
+
+// 面板账号池：拿积分与健康数。key 为空（未启用鉴权）时不带 Authorization。
+async function loadPool() {
+  try {
+    const h = {};
+    if (API_KEY) h.Authorization = "Bearer " + API_KEY;
+    const r = await fetch("/panel/api/overview", { headers: h, cache: "no-store" });
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    pool = await r.json();
+  } catch (e) {
+    pool = null;
+  }
+}
+
+function creditOf(uid) {
+  if (!pool || !Array.isArray(pool.accounts)) return null;
+  const hit = pool.accounts.find(a => a.uid === uid);
+  if (!hit) return null;
+  return hit;
+}
+
+function renderGateway() {
+  const dot = $("#gwDot"), txt = $("#gwText"), sub = $("#gwSub");
+  if (pool) {
+    dot.className = "dot";
+    txt.textContent = "服务运行中";
+    sub.textContent = pool.total ? `可用 ${pool.healthy}/${pool.total} · v${pool.version || ""}` : `未导入账号 · v${pool.version || ""}`;
+    $("#tPool").innerHTML = pool.total ? `${pool.healthy}<small>/ ${pool.total} 可用</small>` : `—<small>未导入</small>`;
+  } else {
+    dot.className = "dot off";
+    txt.textContent = "面板未就绪";
+    sub.textContent = "还没有导入 API 账号";
+    $("#tPool").innerHTML = `—<small>未导入</small>`;
+  }
+  $("#apiBase").textContent = location.host + "/v1";
+  $("#apiKey").textContent = API_KEY || "（未设置，无鉴权）";
+}
+
+function render() {
+  const pills = $("#pills");
+  if (!state.current.length) {
+    pills.innerHTML = '<div class="pill"><span class="dot"></span><span>未检测到登录态</span></div>';
+  } else {
+    pills.innerHTML = state.current.map(a =>
+      `<div class="pill"><span class="dot"></span><span>${escapeHtml(a.nickname)}</span></div>`).join("");
+  }
+
+  $("#navAcc").textContent = state.accounts.length;
+
+  const cur = state.current[0];
+  $("#tCur").textContent = cur ? cur.nickname : "未登录";
+  $("#tSaved").textContent = state.accounts.length;
+  $("#tClient").textContent = state.running ? "运行中" : "未运行";
+  $("#hint").textContent = `客户端 ${state.running ? "运行中" : "未运行"} · 数据目录 profiles/ · 端口 ${state.port || ""}`;
+
+  const list = $("#list");
+  list.innerHTML = "";
+  if (!state.accounts.length) {
+    list.innerHTML = `<div class="empty"><b>还没有保存任何账号</b>先登录 WorkBuddy，点下方「保存当前登录」存下来；换号登录后再点一次。之后这里就能一键来回切换。</div>`;
+    return;
+  }
+
+  for (const a of state.accounts) {
+    const card = document.createElement("div");
+    card.className = "card" + (a.active ? " cur" : "");
+    const tags = a.lines.map(l => `<span class="tag line">${escapeHtml(l)}</span>`).join("");
+    const pa = creditOf(a.uid);
+    const creditTag = pa && pa.credits !== undefined
+      ? `<span class="tag credit" title="API 面板账号池余额">积分 ${fmtNum(pa.credits)}</span>` : "";
+    const stateTag = pa && pa.disabled ? `<span class="tag line">面板已禁用</span>`
+      : (pa && pa.cooling ? `<span class="tag line">面板冷却中</span>` : "");
+
+    card.innerHTML = `
+      <div class="avatar">${initials(a.nickname)}</div>
+      <div class="meta">
+        <div class="name">
+          ${escapeHtml(a.nickname)}
+          ${a.active ? '<span class="tag cur">当前使用</span>' : ""}
+          ${tags}${creditTag}${stateTag}
+          <button class="edit" title="重命名">改名</button>
+        </div>
+        <div class="id">UID ${escapeHtml(a.uid)}${a.saved_at ? " · 保存于 " + fmtDate(a.saved_at) : ""}</div>
+      </div>
+      <button class="act ${a.active ? "" : "primary"}" ${a.active ? "disabled" : ""}>${a.active ? "正在使用" : "切换到此账号"}</button>`;
+
+    card.querySelector(".edit").addEventListener("click", async (ev) => {
+      ev.stopPropagation();
+      const name = prompt("给这个账号起个名字", a.nickname);
+      if (!name || !name.trim() || name.trim() === a.nickname) return;
+      try {
+        await api("/accounts/api/rename", { uid: a.uid, nickname: name.trim() });
+        await load();
+      } catch (e) {
+        toast("改名失败：" + e.message, true);
+      }
+    });
+
+    card.querySelector("button.act").addEventListener("click", () => doSwitch(a, card));
+    list.appendChild(card);
+  }
+}
+
+async function load() {
+  await loadPool();
+  try {
+    state = await api("/accounts/api/state");
+  } catch (e) {
+    toast("读取状态失败：" + e.message, true);
+    return;
+  }
+  renderGateway();
+  render();
+  renderConvs();
+}
+
+// 对话同步：所有账号共用一份本地历史
+function renderConvs() {
+  const box = $("#syncBox"), tag = $("#syncTag"), desc = $("#syncDesc"), sw = $("#swSync");
+  const c = state.convs || { total: 0, by_uid: [] };
+  sw.checked = !!state.share_convs;
+  box.classList.toggle("on", sw.checked);
+
+  if (c.missing) {
+    tag.textContent = "不可用";
+    desc.textContent = "找不到对话数据库，先打开一次 WorkBuddy";
+    $("#btnSyncNow").disabled = true;
+    return;
+  }
+
+  const cur = state.current[0];
+  const mine = c.by_uid.find(x => cur && x.uid === cur.uid);
+  const others = c.by_uid
+    .filter(x => !cur || x.uid !== cur.uid)
+    .reduce((s, x) => s + x.count, 0);
+
+  tag.textContent = `本地 ${c.total} 条`;
+  if (!c.total) {
+    desc.textContent = "本地还没有对话记录";
+  } else if (others > 0) {
+    desc.textContent = `当前账号能看到 ${mine ? mine.count : 0} 条，另有 ${others} 条挂在其他账号下——开启开关或点「立即同步」合并过来`;
+  } else {
+    desc.textContent = `全部 ${c.total} 条都在当前账号名下，换号后开启开关即可继续看到`;
+  }
+  $("#btnSyncNow").disabled = !c.total;
+}
+
+async function doSwitch(a, card) {
+  if (busy || a.active) return;
+  const btn = card.querySelector("button.act");
+  if (!btn) return;
+  busy = true;
+  btn.innerHTML = '<span class="spin"></span>切换中';
+  btn.disabled = true;
+  try {
+    toast("正在切换，客户端即将重启…");
+    const d = await api("/accounts/api/switch", { uid: a.uid, restart: true });
+    toast(d.message || "已切换");
+    document.body.style.opacity = "0.55";
+    setTimeout(async () => {
+      document.body.style.opacity = "1";
+      await load();
+      // 客户端刚重启会抢到前台，把管家重新叫出来，省得用户再点一次图标。
+      api("/accounts/api/focus", {}).catch(() => {});
+    }, 7000);
+  } catch (e) {
+    toast("切换失败：" + e.message, true);
+    btn.textContent = "切换到此账号";
+    btn.disabled = false;
+  } finally {
+    busy = false;
+  }
+}
+
+// ── 视图切换 ─────────────────────────
+function showView(v) {
+  document.querySelectorAll(".nav").forEach(x => x.classList.toggle("on", x.dataset.view === v));
+  document.querySelectorAll(".view").forEach(x => x.classList.toggle("on", x.id === "view-" + v));
+  document.body.classList.toggle("compact", v === "panel");
+  if (v === "panel") loadPanel();
+}
+
+document.querySelectorAll(".nav").forEach(n => {
+  n.onclick = () => showView(n.dataset.view);
+});
+
+// 支持深链：?view=panel 直接进面板（方便做快捷方式）
+if (new URLSearchParams(location.search).get("view") === "panel") showView("panel");
+
+function panelURL() {
+  return "/panel/" + (API_KEY ? "#key=" + encodeURIComponent(API_KEY) : "");
+}
+
+function loadPanel() {
+  if (panelLoaded) return;
+  $("#panelFrame").src = panelURL();
+  panelLoaded = true;
+}
+
+$("#btnReloadPanel").onclick = () => {
+  $("#panelFrame").src = panelURL();
+  panelLoaded = true;
+};
+
+// ── 工具栏 ───────────────────────────
+$("#btnSave").onclick = async () => {
+  const b = $("#btnSave");
+  b.disabled = true;
+  try {
+    const d = await api("/accounts/api/save", {});
+    toast(d.message || "已保存");
+    await load();
+  } catch (e) {
+    toast("保存失败：" + e.message, true);
+  } finally {
+    b.disabled = false;
+  }
+};
+
+$("#btnRestart").onclick = async () => {
+  const b = $("#btnRestart");
+  b.disabled = true;
+  try {
+    await api("/accounts/api/restart", {});
+    toast("已请求重启客户端");
+    setTimeout(load, 2500);
+  } catch (e) {
+    toast("重启失败：" + e.message, true);
+  } finally {
+    b.disabled = false;
+  }
+};
+
+$("#btnReload").onclick = load;
+
+$("#swSync").onchange = async (ev) => {
+  const on = ev.target.checked;
+  try {
+    const d = await api("/accounts/api/convsync", { share: on });
+    state.share_convs = on;
+    $("#syncBox").classList.toggle("on", on);
+    toast(d.message);
+    if (on) setTimeout(load, 400);
+  } catch (e) {
+    ev.target.checked = !on;
+    toast("设置失败：" + e.message, true);
+  }
+};
+
+$("#btnSyncNow").onclick = async () => {
+  const c = state.convs || {};
+  if (!confirm(`会把本机全部 ${c.total || 0} 条对话都归到当前账号名下。\n为了让它生效，WorkBuddy 会被重启（当前对话窗口会关掉）。\n\n继续吗？`)) return;
+  const b = $("#btnSyncNow");
+  b.disabled = true;
+  b.textContent = "同步中…";
+  try {
+    const d = await api("/accounts/api/convsync/apply", {});
+    toast(d.message || "已同步");
+    setTimeout(load, 6000);
+  } catch (e) {
+    toast("同步失败：" + e.message, true);
+  } finally {
+    b.textContent = "立即同步";
+    b.disabled = false;
+  }
+};
+
+$("#btnQuit").onclick = async () => {
+  try { await api("/accounts/api/quit", {}); } catch (e) {}
+  document.body.innerHTML = '<div style="display:grid;place-items:center;height:100vh;color:#6b7280;font-size:13.5px">管家已退出，可以直接关闭此窗口。</div>';
+};
+
+function copyText(text, btn) {
+  const done = () => {
+    const old = btn.textContent;
+    btn.textContent = "已复制";
+    setTimeout(() => { btn.textContent = old; }, 1400);
+  };
+  if (navigator.clipboard && window.isSecureContext) {
+    navigator.clipboard.writeText(text).then(done).catch(() => toast("复制失败", true));
+    return;
+  }
+  const ta = document.createElement("textarea");
+  ta.value = text;
+  ta.style.position = "fixed";
+  ta.style.opacity = "0";
+  document.body.appendChild(ta);
+  ta.select();
+  try { document.execCommand("copy"); done(); } catch (e) { toast("复制失败", true); }
+  document.body.removeChild(ta);
+}
+$("#copyBase").onclick = e => copyText(location.origin + "/v1", e.currentTarget);
+$("#copyKey").onclick = e => copyText(API_KEY, e.currentTarget);
+
+// 心跳：一来让服务端知道窗口还开着（窗口关掉就退服务），
+// 二来做自清理——服务如果已经没了（管家被强杀、或这个窗口是没人管的孤儿），
+// 连续失败就自己关掉，别留一个打不开的空白页面在桌面上。
+let pingFails = 0;
+const pingStart = Date.now();
+setInterval(async () => {
+  try {
+    await fetch("/accounts/api/ping", { method: "POST" });
+    pingFails = 0;
+  } catch (e) {
+    if (Date.now() - pingStart < 15000) return; // 刚打开时服务可能还在起
+    if (++pingFails >= 4) {
+      // Chromium 不允许脚本关掉 --app 窗口，先试一次；关不掉就换成明确提示，
+      // 免得留一个看起来坏掉的空白页让人以为程序出问题了。
+      window.close();
+      setTimeout(() => {
+        document.body.innerHTML =
+          '<div style="display:grid;place-items:center;height:100vh;color:#6b7280;font-size:13.5px">管家已经退出了，这个窗口可以直接关掉。</div>';
+      }, 400);
+    }
+  }
+}, 3000);
+
+load();
+setTimeout(load, 1500);
+</script>
+</body>
+</html>
