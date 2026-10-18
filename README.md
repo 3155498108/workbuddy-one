@@ -11,6 +11,20 @@
 
 ---
 
+## 下载
+
+不想装 Go 自己编译的，直接拿现成的：
+
+**[Releases](https://github.com/3155498108/workbuddy-one/releases)** → `WorkBuddyOne-v1.0.0-win64.zip`（约 3.9 MB）
+
+解压后双击 `WorkBuddyOne.exe` 就能用，**不需要装 Go、Node 或任何运行时**——界面是调用系统自带的
+Edge（或 Chrome）以 `--app` 模式显示，Windows 10/11 上本来就有。首次运行会在同目录自动生成
+配置和随机 API 密钥。
+
+> exe 没有代码签名，首次运行 Windows 会弹「已保护你的电脑」，点「更多信息 → 仍要运行」即可。
+
+---
+
 ## 界面
 
 ![账号切换界面](docs/screenshots/accounts.png)
@@ -114,8 +128,26 @@ go build -trimpath -ldflags "-H=windowsgui -s -w" -o WorkBuddyOne.exe ./cmd/wbon
 go build -trimpath -o wb2api.exe ./cmd/server
 ```
 
-`cmd/wbone/` 下的 `rsrc.syso` 是图标资源、`app.manifest` 是 DPI/权限声明，
-两者都是编译期需要的，别删。
+`cmd/wbone/rsrc.syso` 是编译期资源（**图标 + manifest + 版本信息**），别删。
+它由 [go-winres](https://github.com/tc-hib/go-winres) 生成，改版本号时照抄这份命令：
+
+```bash
+go install github.com/tc-hib/go-winres@latest
+cd cmd/wbone
+go-winres simply --arch amd64 --out wbone --manifest gui \
+  --icon app.ico \
+  --product-name "WorkBuddy 管家" \
+  --file-description "WorkBuddy 客户端账号切换 + API 面板" \
+  --file-version 1.0.0 --product-version 1.0.0 \
+  --original-filename WorkBuddyOne.exe \
+  --copyright "MIT License"
+mv wbone_windows_amd64.syso rsrc.syso
+```
+
+两点注意：`--out X --no-suffix` 输出的是**没有扩展名的文件 `X`**（Go 不会把它当资源链接进去），
+所以要按上面的写法先生成带后缀的，再改名成 `rsrc.syso`；
+同一个目录里**只能有一个 `.syso`**，否则资源重复会导致链接失败。
+`app.manifest` 留作参考（Common-Controls / DPI / asInvoker 声明），实际生效的是 syso 里那份。
 
 ## 运行
 
