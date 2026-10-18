@@ -29,7 +29,10 @@ backups/
 LOOP.md
 PLAN.md
 SPEC.md
-docs/
+# docs/ 原本整体忽略（设计文档），但 README 需要引用截图，故放行 docs/screenshots/
+docs/*
+!docs/screenshots/
+!docs/screenshots/**
 
 # 设计/计划文档（但 README.md 必须进版本库）
 *.md
