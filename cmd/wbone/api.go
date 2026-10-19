@@ -215,7 +215,7 @@ func registerAccounts(mux *http.ServeMux) {
 		lastSeen.Store(time.Now().UnixNano())
 		// 切号后 WorkBuddy 客户端会重新启动并抢到前台，管家窗口被压在后面。
 		// 用户以为管家没了就会再点一次图标——那正是产生孤儿窗口的源头。
-		h := ensureVisible(appTitle, 4)
+		h := ensureVisibleSelf(4)
 		writeJSON(w, map[string]any{"ok": true, "found": h != 0})
 	})
 	mux.HandleFunc("POST /accounts/api/quit", func(w http.ResponseWriter, r *http.Request) {

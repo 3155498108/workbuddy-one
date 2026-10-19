@@ -226,16 +226,35 @@ func openWindow(url string) {
 
 var (
 	u32             = syscall.NewLazyDLL("user32.dll")
+	k32             = syscall.NewLazyDLL("kernel32.dll")
 	pEnumWindows    = u32.NewProc("EnumWindows")
 	pGetWindowTextW = u32.NewProc("GetWindowTextW")
+	pGetWindowPID   = u32.NewProc("GetWindowThreadProcessId")
 	pShowWindow     = u32.NewProc("ShowWindow")
 	pSetForeground  = u32.NewProc("SetForegroundWindow")
-	pPostMessageW   = u32.NewProc("PostMessageW")
 	pMessageBoxW    = u32.NewProc("MessageBoxW")
+	pCreateSnapshot = k32.NewProc("CreateToolhelp32Snapshot")
+	pProc32First    = k32.NewProc("Process32FirstW")
+	pProc32Next     = k32.NewProc("Process32NextW")
 
-	winTarget        string
-	winFound         []uintptr
+	// 只认「自己拉起的浏览器进程树」里的窗口。
+	//
+	// 早先按标题子串匹配，把用户自己浏览器里的同名页面也算了进来：用户在
+	// GitHub 上看 Release 页（标题含「WorkBuddy 管家」），管家一启动就对那个
+	// 窗口发 SW_RESTORE（最大化被还原，看着"变小了"），退出时再 WM_CLOSE，
+	// 直接把人家的窗口关掉。窗口归属必须按进程判断，标题只能当辅助条件。
+	winTarget  string
+	winAllowed map[uint32]bool
+	winFound   []uintptr
+
 	enumWindowHandle = syscall.NewCallback(func(h, l uintptr) uintptr {
+		if winAllowed != nil {
+			var pid uint32
+			pGetWindowPID.Call(h, uintptr(unsafe.Pointer(&pid)))
+			if !winAllowed[pid] {
+				return 1
+			}
+		}
 		buf := make([]uint16, 512)
 		pGetWindowTextW.Call(h, uintptr(unsafe.Pointer(&buf[0])), uintptr(len(buf)))
 		if strings.Contains(syscall.UTF16ToString(buf), winTarget) {
@@ -245,18 +264,91 @@ var (
 	})
 )
 
-func findWindows(part string) []uintptr {
+// processEntry32 对应 Win32 的 PROCESSENTRY32W，只用到进程号与父进程号。
+type processEntry32 struct {
+	Size            uint32
+	CntUsage        uint32
+	ProcessID       uint32
+	DefaultHeapID   uintptr
+	ModuleID        uint32
+	CntThreads      uint32
+	ParentProcessID uint32
+	PriClassBase    int32
+	Flags           uint32
+	ExeFile         [260]uint16
+}
+
+// descendantPIDs 返回 root 的全部子孙进程（Chromium 的窗口往往挂在子进程上）。
+func descendantPIDs(root uint32) []uint32 {
+	const (
+		th32csSnapProcess = 0x00000002
+		invalidHandle     = ^uintptr(0)
+	)
+	snap, _, _ := pCreateSnapshot.Call(th32csSnapProcess, 0)
+	if snap == 0 || snap == invalidHandle {
+		return nil
+	}
+	defer syscall.CloseHandle(syscall.Handle(snap))
+
+	children := map[uint32][]uint32{}
+	var pe processEntry32
+	pe.Size = uint32(unsafe.Sizeof(pe))
+	ok, _, _ := pProc32First.Call(snap, uintptr(unsafe.Pointer(&pe)))
+	for ok != 0 {
+		children[pe.ParentProcessID] = append(children[pe.ParentProcessID], pe.ProcessID)
+		ok, _, _ = pProc32Next.Call(snap, uintptr(unsafe.Pointer(&pe)))
+	}
+
+	var out []uint32
+	queue := []uint32{root}
+	seen := map[uint32]bool{root: true}
+	for len(queue) > 0 {
+		cur := queue[0]
+		queue = queue[1:]
+		for _, c := range children[cur] {
+			if seen[c] {
+				continue
+			}
+			seen[c] = true
+			out = append(out, c)
+			queue = append(queue, c)
+		}
+	}
+	return out
+}
+
+// browserWindowPIDs 是本次拉起的浏览器进程 + 它的子孙。
+func browserWindowPIDs() []uint32 {
+	if browser == nil || browser.Process == nil {
+		return nil
+	}
+	root := uint32(browser.Process.Pid)
+	return append([]uint32{root}, descendantPIDs(root)...)
+}
+
+func pidSet(ids []uint32) map[uint32]bool {
+	m := make(map[uint32]bool, len(ids))
+	for _, v := range ids {
+		m[v] = true
+	}
+	return m
+}
+
+func findWindows(part string, allow map[uint32]bool) []uintptr {
 	winTarget = part
+	winAllowed = allow
 	winFound = nil
 	pEnumWindows.Call(enumWindowHandle, 0)
 	return winFound
 }
 
-// ensureVisible 主动把窗口恢复并提到前台：无控制台进程拉起 Chromium 时，
-// 首个窗口可能继承到隐藏/最小化状态，表现为「进程在、标题对、屏幕上什么都没有」。
-func ensureVisible(part string, tries int) uintptr {
+// ensureVisibleSelf 把自己拉起的那个窗口恢复并提到前台。
+//
+// 无控制台进程拉起 Chromium 时，首个窗口可能继承到隐藏/最小化状态，需要主动
+// SHOW 一下。但只在自家进程树里找——宁可找不到，也不能碰别人的窗口。
+func ensureVisibleSelf(tries int) uintptr {
 	for i := 0; i < tries; i++ {
-		if hs := findWindows(part); len(hs) > 0 {
+		if hs := findWindows(appTitle, pidSet(browserWindowPIDs())); len(hs) > 0 {
 			h := hs[0]
 			pShowWindow.Call(h, 9) // SW_RESTORE
 			pShowWindow.Call(h, 5) // SW_SHOW
@@ -278,18 +370,40 @@ func shutdown() {
 	if stopAll != nil {
 		stopAll()
 	}
-	for _, h := range findWindows(appTitle) {
-		pPostMessageW.Call(h, 0x0010) // WM_CLOSE
-	}
-	time.Sleep(600 * time.Millisecond)
+	// 只结束自己拉起的那个浏览器进程，Job 会把它的子进程一并收走。
+	// 这里刻意不再遍历窗口发 WM_CLOSE：标题相同不代表窗口是我们的，
+	// 用户浏览器里开着同名页面时，那一下会直接关掉用户自己的标签页。
 	if browser != nil && browser.Process != nil {
 		_ = browser.Process.Kill()
-		time.Sleep(300 * time.Millisecond)
+		time.Sleep(400 * time.Millisecond)
 	}
 	if browserProfile != "" {
 		_ = os.RemoveAll(browserProfile)
 	}
 	os.Exit(0)
+}
+
+// focusExisting 让已经在跑的那个实例把自己的窗口叫到前台。
+//
+// 为什么不让新进程自己去找窗口：只有宿主知道自己拉起了哪个浏览器进程，
+// 新进程手上没有这个信息，只能按标题猜——而标题会撞车（用户浏览器里正好
+// 开着含「WorkBuddy 管家」的页面），一猜就误伤。
+func focusExisting() bool {
+	cli := &http.Client{Timeout: 3 * time.Second}
+	req, err := http.NewRequest(http.MethodPost, baseURL()+"accounts/api/focus", nil)
+	if err != nil {
+		return false
+	}
+	resp, err := cli.Do(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	var out struct {
+		Found bool `json:"found"`
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&out)
+	return out.Found
 }
 
 // ── 启动 ────────────────────────────────────────────────────────────
@@ -374,10 +488,11 @@ func main() {
 	// 用户看到的就是"莫名多出一个 Edge 页面，关也关不掉"。
 	if ownInstance() {
 		logf("已有实例运行在 %s，唤出既有窗口", baseURL())
-		if ensureVisible(appTitle, 6) == 0 {
-			// 窗口确实没了（服务还在）才补一个，这时它会被本进程接管到退出为止。
-			openWindow(baseURL())
-			time.Sleep(1200 * time.Millisecond)
+		if !focusExisting() {
+			// 对方没响应、或它自己手上也没有窗口。这里不再补开：本进程马上就要
+			// 退出，新开的窗口没人接管，会变成关不掉的孤儿。老实例检测到浏览器
+			// 进程已死会自行退出，用户再点一次图标即可。
+			logf("既有实例未返回窗口，等待其自行退出")
 		}
 		return
 	}
@@ -405,7 +520,7 @@ func main() {
 	logf("已启动：%s（客户端：%s）", baseURL(), findClient())
 
 	go func() {
-		if h := ensureVisible(appTitle, 30); h != 0 {
+		if h := ensureVisibleSelf(30); h != 0 {
 			logf("窗口已显示 hwnd=%d", h)
 		} else {
 			logf("警告：没有找到窗口")
