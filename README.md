@@ -15,7 +15,7 @@
 
 不想装 Go 自己编译的，直接拿现成的：
 
-**[Releases](https://github.com/3155498108/workbuddy-one/releases)** → `WorkBuddyOne-v1.0.0-win64.zip`（约 3.9 MB）
+**[Releases](https://github.com/3155498108/workbuddy-one/releases)** → `WorkBuddyOne-v1.0.1-win64.zip`（约 3.9 MB）
 
 解压后双击 `WorkBuddyOne.exe` 就能用，**不需要装 Go、Node 或任何运行时**——界面是调用系统自带的
 Edge（或 Chrome）以 `--app` 模式显示，Windows 10/11 上本来就有。首次运行会在同目录自动生成
@@ -138,7 +138,7 @@ go-winres simply --arch amd64 --out wbone --manifest gui \
   --icon app.ico \
   --product-name "WorkBuddy 管家" \
   --file-description "WorkBuddy 客户端账号切换 + API 面板" \
-  --file-version 1.0.0 --product-version 1.0.0 \
+  --file-version 1.0.1 --product-version 1.0.1 \
   --original-filename WorkBuddyOne.exe \
   --copyright "MIT License"
 mv wbone_windows_amd64.syso rsrc.syso
