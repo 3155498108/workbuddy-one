@@ -204,6 +204,12 @@ func openWindow(url string) {
 			"--disable-features=Translate",
 			// 关窗口即退出进程，不在托盘/后台常驻（否则管家永远等不到"窗口关闭"）。
 			"--disable-background-mode",
+			// 全新 profile 首次启动时，Edge 会从系统里的默认浏览器导入扩展和书签：
+			// Tampermonkey、IDM、TeraBox 这些全被搬进来，装完/更新完各自弹一次
+			// 欢迎页——用户看到的就是「莫名启动 Edge 并打开一个奇怪的链接」。
+			// 管家页面是纯 HTML/JS，不需要任何扩展，直接禁用，同时绕过导入流程。
+			"--disable-extensions",
+			"--disable-sync",
 			// 全部请求都在本机回环上：显式关掉系统代理。
 			// 有些代理软件（Clash/Surge 的 TUN 或全局模式）会把 127.0.0.1 也劫持，
 			// 结果窗口打开只剩一行 "upstream connect failed"，页面脚本不执行、心跳不发。
