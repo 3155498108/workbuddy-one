@@ -1,7 +1,7 @@
 // main.go WorkBuddy 管家 —— 一个进程装下两件事：
 //
-//	1. 账号切换：替换客户端登录态 + 重启 WorkBuddy（原 WbSwitch）
-//	2. API 面板：workbuddy2api 网关与它的管理面板（internal/gwapi）
+//  1. 账号切换：替换客户端登录态 + 重启 WorkBuddy（原 WbSwitch）
+//  2. API 面板：workbuddy2api 网关与它的管理面板（internal/gwapi）
 //
 // 关键点：两者跑在同一个 http.Server、同一个端口上，所以面板不需要 iframe 跨源，
 // 也不会出现「两个程序、两个窗口、两个端口」的割裂感。
@@ -33,7 +33,7 @@ import (
 
 const (
 	appTitle   = "WorkBuddy 管家"
-	appVersion = "1.0.2"
+	appVersion = "1.0.3"
 )
 
 var browserCandidates = []string{
@@ -87,7 +87,8 @@ func logf(format string, args ...any) {
 // shellHTML 把 API key 注入页面：面板 iframe 带 #key= 打开后自动登录，
 // 账号页也能直接调 /panel/api/overview 显示积分。
 func shellHTML() []byte {
-	return bytes.Replace(uiHTML, []byte("{{API_KEY}}"), []byte(apiKey), 1)
+	out := bytes.Replace(uiHTML, []byte("{{API_KEY}}"), []byte(apiKey), -1)
+	return bytes.Replace(out, []byte("{{VERSION}}"), []byte(appVersion), -1)
 }
 
 // decorate 在网关 handler 外层挂载统一界面："/" 是我们自己的页面，
@@ -95,6 +96,7 @@ func shellHTML() []byte {
 func decorate(next http.Handler) http.Handler {
 	mux := http.NewServeMux()
 	registerAccounts(mux)
+	registerUpdate(mux)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
 			next.ServeHTTP(w, r)
@@ -163,8 +165,13 @@ func localClient(timeout time.Duration) *http.Client {
 }
 
 // ownInstance 端口上跑的是不是我们自己（用于单实例复用窗口）。
+//
+// 打的是 /accounts/api/ping 而不是 /accounts/api/state：后者要扫一遍本地对话
+// 数据库，WorkBuddy 客户端正锁着库时会卡好几秒，700ms 的超时必然踩空——
+// 那样就会把「自己」认成「别的程序」，waitReady 空转、单实例逻辑也会走错。
+// ping 只回一个身份标记，纯内存，快且稳。
 func ownInstance() bool {
-	resp, err := localClient(700 * time.Millisecond).Get(baseURL() + "accounts/api/state")
+	resp, err := localClient(1500 * time.Millisecond).Get(baseURL() + "accounts/api/ping")
 	if err != nil {
 		return false
 	}
@@ -172,10 +179,8 @@ func ownInstance() bool {
 	if resp.StatusCode != http.StatusOK {
 		return false
 	}
-	// 不能用单次 Read：它可能只返回本次到达的那一段，而 "accounts" 在响应里
-	// 排在 current 之后（偏移随账号数增长），读半截就会误判成「不是我」。
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<10))
-	return strings.Contains(string(body), `"accounts"`)
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
+	return strings.Contains(string(body), `"app":"wbone"`)
 }
 
 func portFree(port string) bool {
@@ -503,6 +508,16 @@ func main() {
 	apiKey = cfg.APIKey
 	appPort = listenPort(cfg.Listen)
 
+	// 更新接棒：这个进程是老版本拉起的新版本，而老版本可能还在退出路上、
+	// 端口没释放。必须先等它让出来——否则下面的 ownInstance() 会把「正在
+	// 退出的老版本」当成活着的实例，新进程直接退出，用户看到的就是
+	// 「更新完打不开了」。这是自动更新最容易踩的坑。
+	handoffWait()
+
+	// 老版本留下的 WorkBuddyOne.exe.old 在这里删；旧进程可能还没退干净，
+	// 删不掉就过一会儿再试，失败的留着不影响使用。
+	go cleanupOldExe()
+
 	// 单实例：已有管家在跑，就把那个窗口叫到前台，不重复占端口。
 	//
 	// 这里绝不能再 openWindow：本进程紧接着就退出了，新开出来的 Edge 窗口
@@ -533,9 +548,11 @@ func main() {
 
 	lastSeen.Store(time.Now().UnixNano())
 	if !waitReady(20 * time.Second) {
-		logf("网关启动超时")
-		msgBox("服务启动超时，请查看 data\\app.log。")
-		shutdown()
+		// 只是「没等到就绪」，不是致命错误：网关真正的启动失败会从 gwErr 回来，
+		// 那时才该退出。这里照常开窗——服务可能只是初始化慢（比如客户端正锁着
+		// 对话数据库），页面自己会重试。早先在这里弹框 + 退出，无人值守时
+		// 会卡在一个没人点的对话框上，服务明明活着却用不了。
+		logf("等待网关就绪超时（继续启动，服务可能仍在初始化）")
 	}
 
 	openWindow(baseURL())
@@ -547,6 +564,13 @@ func main() {
 		} else {
 			logf("警告：没有找到窗口")
 		}
+	}()
+
+	// 每天最多静默查一次更新。放在窗口出来之后、延迟几秒，
+	// 不跟启动抢网络和 CPU；查到了只在侧栏亮一行，不会自己动手装。
+	go func() {
+		time.Sleep(6 * time.Second)
+		autoCheckOnce()
 	}()
 
 	ticker := time.NewTicker(3 * time.Second)

@@ -15,7 +15,7 @@
 
 不想装 Go 自己编译的，直接拿现成的：
 
-**[Releases](https://github.com/3155498108/workbuddy-one/releases)** → `WorkBuddyOne-v1.0.2-win64.zip`（约 4.1 MB）
+**[Releases](https://github.com/3155498108/workbuddy-one/releases)** → `WorkBuddyOne-v1.0.3-win64.zip`（约 4.1 MB）
 
 解压后双击 `WorkBuddyOne.exe` 就能用，**不需要装 Go、Node 或任何运行时**——界面是调用系统自带的
 Edge（或 Chrome）以 `--app` 模式显示，Windows 10/11 上本来就有。首次运行会在同目录自动生成
@@ -78,7 +78,7 @@ Edge（或 Chrome）以 `--app` 模式显示，Windows 10/11 上本来就有。�
 
 ---
 
-## 三个功能
+## 四个功能
 
 ### 1. 账号切换（核心）
 
@@ -114,6 +114,27 @@ WorkBuddy 的对话按账号隔离：`~/.workbuddy/workbuddy.db` 的 `sessions` 
 
 改动前会自动备份数据库到 `backup/workbuddy-db-<日期>.db`。
 
+### 4. 自动更新
+
+侧栏底部一直显示当前版本。每天启动后静默查一次有没有新版本，只有查到才变蓝；
+点一下就能下载替换、自动重启，**只换 exe，账号快照、配置、对话记录都不动**。
+
+几个刻意做成这样的地方：
+
+- **只查、不自动装**。替换 exe 必须重启管家，你正在切号时被重启会打断操作，
+  所以自动检查只负责提示，装不装由你点。
+- **装的是 zip 不是裸 exe**。zip 每条记录都有 CRC，解压时能发现下载被截断或被
+  中间页顶掉；裸 exe 拿不到任何完整性信息。取出后还会校验 PE 文件头。
+- **换文件靠改名，不靠覆盖**。Windows 上正在运行的 exe 允许改名、不允许覆盖，
+  所以顺序是「旧的改名 `.old` → 新的改名到位」，任何一步失败都回滚，
+  你手上始终有一个能启动的 exe。
+- **新进程会等端口**。旧进程退出的最后几百毫秒里端口还占着，新版本如果直接起
+  会因「端口被占用」自杀——那才是真的「更新完打不开了」。接棒启动时会先等端口释放。
+
+更新源默认是 GitHub Release 的 `latest`，连不上（比如没代理）会明确报错、不影响正常使用。
+要换镜像可以设环境变量 `WBONE_UPDATE_FEED` 或在 `data/prefs.json` 里写 `update_feed`
+（格式同 GitHub `releases/latest` 的响应）。
+
 ---
 
 ## 构建
@@ -138,7 +159,7 @@ go-winres simply --arch amd64 --out wbone --manifest gui \
   --icon app.ico \
   --product-name "WorkBuddy 管家" \
   --file-description "WorkBuddy 客户端账号切换 + API 面板" \
-  --file-version 1.0.2 --product-version 1.0.2 \
+  --file-version 1.0.3 --product-version 1.0.3 \
   --original-filename WorkBuddyOne.exe \
   --copyright "MIT License"
 mv wbone_windows_amd64.syso rsrc.syso

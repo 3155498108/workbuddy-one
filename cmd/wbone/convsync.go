@@ -288,6 +288,12 @@ func backupDBOnce(path string) error {
 
 type prefs struct {
 	ShareConversations bool `json:"share_conversations"`
+
+	// 更新相关（update.go）。三项都取「零值即默认行为」，老版本读新文件、
+	// 新版本读老文件都不会出错：没写过 = 开着自动检查、24 小时没查过。
+	UpdateCheckOff  bool   `json:"update_check_off,omitempty"`
+	LastUpdateCheck int64  `json:"last_update_check,omitempty"` // unix 秒
+	UpdateFeed      string `json:"update_feed,omitempty"`       // 自定义更新源（GitHub API 形状）
 }
 
 func prefsPath() string { return filepath.Join(baseDir(), "data", "prefs.json") }

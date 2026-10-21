@@ -110,6 +110,13 @@ func registerAccounts(mux *http.ServeMux) {
 		lastSeen.Store(time.Now().UnixNano())
 		writeJSON(w, buildState())
 	})
+	mux.HandleFunc("GET /accounts/api/ping", func(w http.ResponseWriter, r *http.Request) {
+		lastSeen.Store(time.Now().UnixNano())
+		// 只回一个身份标记，不做任何 IO：这个接口被启动自检（ownInstance）
+		// 高频调用，绝不能碰数据库——/accounts/api/state 要扫对话库，
+		// WorkBuddy 客户端锁着库时会卡到超时，自检就会误判「端口上不是自己」。
+		writeJSON(w, map[string]any{"ok": true, "app": "wbone", "version": appVersion})
+	})
 	mux.HandleFunc("POST /accounts/api/ping", func(w http.ResponseWriter, r *http.Request) {
 		lastSeen.Store(time.Now().UnixNano())
 		writeJSON(w, map[string]any{"ok": true})

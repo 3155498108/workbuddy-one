@@ -48,6 +48,17 @@
   .side-foot .dot{display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--ok);margin-right:5px;vertical-align:1px}
   .side-foot .dot.off{background:#c2c7d0}
 
+  /* 更新行：默认安静地显示版本号，发现新版本才变蓝并露出按钮 */
+  .upd{display:flex;align-items:center;gap:6px;margin:8px 6px 0;padding:6px 7px;border-radius:8px;background:#f7f9fc;font-size:11.5px;color:#8b929e}
+  .upd span{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .upd button{flex:0 0 auto;font:inherit;font-size:11px;line-height:1.5;padding:2px 7px;border-radius:6px;border:1px solid #dfe3ea;background:#fff;color:#6b7280;cursor:pointer}
+  .upd button:hover{border-color:#c3cbd8;color:var(--text)}
+  .upd button:disabled{opacity:.6;cursor:default}
+  .upd.hot{background:var(--accent-soft);color:#1d4ed8}
+  .upd.hot span{font-weight:650}
+  .upd.hot button{background:var(--accent);border-color:var(--accent);color:#fff}
+  body.compact .upd{display:none}
+
   /* 面板视图：侧栏收成图标条，把宽度让给 iframe（两层侧栏并排太挤） */
   body.compact .side{width:58px;flex-basis:58px;padding:16px 8px 12px}
   body.compact .brand{justify-content:center;padding:2px 0 16px}
@@ -214,6 +225,11 @@
       </button>
     </nav>
 
+    <div class="upd" id="updBox">
+      <span id="updText">v{{VERSION}}</span>
+      <button id="btnUpd">检查更新</button>
+    </div>
+
     <div class="side-foot">
       <div><span class="dot" id="gwDot"></span><span id="gwText">服务启动中</span></div>
       <div id="gwSub"></div>
@@ -291,6 +307,7 @@
 
 <script>
 const API_KEY = "{{API_KEY}}";
+const CUR_VER = "{{VERSION}}";
 const $ = s => document.querySelector(s);
 let state = { accounts: [], current: [], running: false };
 let pool = null;          // /panel/api/overview 结果
@@ -449,7 +466,85 @@ async function load() {
   renderGateway();
   render();
   renderConvs();
+  loadUpdate();
 }
+
+// 更新：只读服务端缓存的状态（不会因为刷新页面就去打 GitHub）
+let upd = null;
+async function loadUpdate() {
+  try {
+    const r = await fetch("/accounts/api/update", { cache: "no-store" });
+    if (r.ok) upd = await r.json();
+  } catch (e) { /* 更新检查不可用不影响主功能 */ }
+  renderUpdate();
+}
+
+function renderUpdate() {
+  const box = $("#updBox"), txt = $("#updText"), btn = $("#btnUpd");
+  if (!box) return;
+  const cur = (upd && upd.current) || CUR_VER;
+  const has = !!(upd && upd.has_update);
+  box.classList.toggle("hot", has);
+  if (has) {
+    txt.textContent = `v${cur} → v${upd.latest}`;
+    btn.textContent = btn.disabled ? "更新中…" : "更新";
+  } else if (upd && upd.applying) {
+    txt.textContent = `正在更新到 v${upd.latest}`;
+    btn.textContent = "更新中…";
+  } else {
+    txt.textContent = upd && upd.checked_at
+      ? `v${cur} · ${upd.checked_at.slice(5)} 已检查`
+      : `v${cur}`;
+    btn.textContent = btn.disabled ? "检查中…" : "检查更新";
+  }
+  box.title = has ? `发现新版本 v${upd.latest}，点「更新」自动升级` : "检查是否有新版本";
+}
+
+$("#btnUpd").onclick = async () => {
+  const btn = $("#btnUpd");
+  if (btn.disabled) return;
+  btn.disabled = true;
+
+  // 有新版本 → 装；没有 → 查。
+  if (upd && upd.has_update) {
+    const mb = upd.asset_size ? (upd.asset_size / 1048576).toFixed(1) + " MB" : "安装包";
+    if (!confirm(
+      `将下载 v${upd.latest}（${mb}）并替换当前程序。\n\n` +
+      `管家会自动重启，窗口会关闭一次，几秒后重新出现。\n` +
+      `账号、配置、对话记录都不受影响（只换 exe）。\n\n继续吗？`)) {
+      btn.disabled = false;
+      renderUpdate();
+      return;
+    }
+    btn.textContent = "下载中…";
+    try {
+      const d = await api("/accounts/api/update/apply", {});
+      toast(d.message || "正在更新，管家即将重启");
+      setTimeout(() => {
+        document.body.innerHTML =
+          `<div style="display:grid;place-items:center;height:100vh;color:#6b7280;font-size:13.5px;line-height:1.9;text-align:center">
+             <div>正在更新到 v${upd.latest}，管家会自动重启<br><small style="color:#9aa1ad">稍等几秒，窗口会重新打开</small></div>
+           </div>`;
+      }, 700);
+    } catch (e) {
+      toast("更新失败：" + e.message, true);
+      btn.disabled = false;
+      loadUpdate();
+    }
+    return;
+  }
+
+  btn.textContent = "检查中…";
+  try {
+    upd = await api("/accounts/api/update/check", {});
+    toast(upd.has_update ? `发现新版本 v${upd.latest}` : "已是最新版本");
+  } catch (e) {
+    toast("检查失败：" + e.message, true);
+  } finally {
+    btn.disabled = false;
+    renderUpdate();
+  }
+};
 
 // 对话同步：所有账号共用一份本地历史
 function renderConvs() {
