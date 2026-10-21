@@ -114,6 +114,11 @@ var autoActions = []autoAction{
 		run:      runExpertTeamUse,
 	},
 	{
+		TaskCode: "WorkBuddy_Valorant",
+		Desc:     "召唤「无畏契约拼豆专家」并完成一次对话（11-15 前活动任务）",
+		run:      runValorant,
+	},
+	{
 		TaskCode: "Hp_Appearance",
 		Desc:     "设置主题 API + 皮肤生效事件（已验证：两账号点亮）",
 		run:      runAppearance,
@@ -1072,28 +1077,12 @@ func runExpertBatch(p *Panel, a *auth.Auth, expertType string, count int) (strin
 	if len(experts) == 0 {
 		return "", fmt.Errorf("专家市场列表为空")
 	}
-	ok, fail := 0, 0
+	ok := 0
 	for i, e := range experts {
 		if ok >= count {
 			break
 		}
-		// 召唤链（web_element_click + summon_click + summoned）。
-		summonEvents := upstream.DesktopExpertSummonSequence(e)
-		if err := p.cfg.Upstream.ReportDesktopEvent(a, summonEvents...); err != nil {
-			fail++
-			continue
-		}
-		// 真实 chat（带 X-Expert-Id）→ 服务端 requestId。
-		conv, req, cerr := p.cfg.Upstream.DesktopChatWithExpert(a, e.ExpertID)
-		if cerr != nil {
-			fail++
-			continue
-		}
-		// 使用事件（JOIN 服务端 requestId）+ chat 链。
-		events := append(upstream.DesktopChatSequence(conv, req, "msg-"+req[len(req)-8:], "fast-model", "fast-model"),
-			upstream.DesktopExpertActualUseEvent(e, conv, req))
-		if err := p.cfg.Upstream.ReportDesktopEvent(a, events...); err != nil {
-			fail++
+		if err := useOneExpert(p, a, e); err != nil {
 			continue
 		}
 		ok++
@@ -1101,8 +1090,50 @@ func runExpertBatch(p *Panel, a *auth.Auth, expertType string, count int) (strin
 			time.Sleep(expertSummonGap)
 		}
 	}
-	_ = fail
 	return fmt.Sprintf("已对 %d 位真实专家完成召唤+使用链（类型 %s）", ok, expertType), nil
+}
+
+// useOneExpert 对单个专家跑完整链路：召唤事件 → 真实对话 → 使用事件上报。
+// 成批的 runExpertBatch 与活动类单专家任务（WorkBuddy_Valorant）共用这段。
+func useOneExpert(p *Panel, a *auth.Auth, e upstream.MarketExpert) error {
+	// 召唤链（web_element_click + summon_click + summoned）。
+	if err := p.cfg.Upstream.ReportDesktopEvent(a, upstream.DesktopExpertSummonSequence(e)...); err != nil {
+		return err
+	}
+	// 真实 chat（带 X-Expert-Id）→ 服务端 requestId。
+	conv, req, err := p.cfg.Upstream.DesktopChatWithExpert(a, e.ExpertID)
+	if err != nil {
+		return err
+	}
+	if len(req) < 8 {
+		return fmt.Errorf("requestId 异常：%q", req)
+	}
+	// 使用事件（JOIN 服务端 requestId）+ chat 链。
+	events := append(upstream.DesktopChatSequence(conv, req, "msg-"+req[len(req)-8:], "fast-model", "fast-model"),
+		upstream.DesktopExpertActualUseEvent(e, conv, req))
+	return p.cfg.Upstream.ReportDesktopEvent(a, events...)
+}
+
+// runValorant 完成 WorkBuddy_Valorant：体验「无畏契约拼豆专家」（活动任务，11-15 截止）。
+//
+// 判据与 expert_5 同属 expert_actual_use，只是限定了具体专家，所以直接复用单专家链路。
+// 这个专家 2026-10-20 才上架，不硬编码 id——按中文名在实时市场列表里找，
+// 否则 id 变了或者作者改名就静默失配。
+func runValorant(p *Panel, a *auth.Auth) (string, error) {
+	experts, err := p.cfg.Upstream.MarketExpertList(a, "agent")
+	if err != nil {
+		return "", fmt.Errorf("拉取专家列表: %w", err)
+	}
+	for _, e := range experts {
+		if !strings.Contains(e.DisplayNameZH, "无畏契约") && !strings.Contains(e.ProfessionZH, "无畏契约") {
+			continue
+		}
+		if err := useOneExpert(p, a, e); err != nil {
+			return "", fmt.Errorf("%s：%w", e.DisplayNameZH, err)
+		}
+		return "已召唤「" + e.DisplayNameZH + "」并完成一次对话", nil
+	}
+	return "", fmt.Errorf("市场列表（%d 条）里没找到「无畏契约拼豆专家」", len(experts))
 }
 
 // ---------------------------------------------------------------------------
