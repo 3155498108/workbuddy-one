@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"net"
 	"net/http"
@@ -146,10 +147,24 @@ func listenPort(addr string) string {
 
 func baseURL() string { return "http://127.0.0.1:" + appPort + "/" }
 
+// localClient 访问本机 127.0.0.1 的专用客户端：强制不走代理。
+//
+// http.Client 缺省 Transport 的 Proxy 是 ProxyFromEnvironment，只要环境里存在
+// HTTP_PROXY/HTTPS_PROXY（Clash、v2ray、公司代理、IDE 终端都会设），发往
+// localhost 的自检请求也会被丢给代理。代理通常拒绝或拖到超时，于是
+// ownInstance() 恒为 false → waitReady 撑满 20 秒 → 打印「网关启动超时」自己
+// 退出，而服务其实一直在正常监听。用户看到的就是「双击没反应」。
+// Edge 那边早就加了 --no-proxy-server，这里是同一课的 Go 侧版本。
+func localClient(timeout time.Duration) *http.Client {
+	return &http.Client{
+		Timeout:   timeout,
+		Transport: &http.Transport{Proxy: nil},
+	}
+}
+
 // ownInstance 端口上跑的是不是我们自己（用于单实例复用窗口）。
 func ownInstance() bool {
-	cli := &http.Client{Timeout: 700 * time.Millisecond}
-	resp, err := cli.Get(baseURL() + "accounts/api/state")
+	resp, err := localClient(700 * time.Millisecond).Get(baseURL() + "accounts/api/state")
 	if err != nil {
 		return false
 	}
@@ -157,9 +172,10 @@ func ownInstance() bool {
 	if resp.StatusCode != http.StatusOK {
 		return false
 	}
-	buf := make([]byte, 256)
-	n, _ := resp.Body.Read(buf)
-	return strings.Contains(string(buf[:n]), `"accounts"`)
+	// 不能用单次 Read：它可能只返回本次到达的那一段，而 "accounts" 在响应里
+	// 排在 current 之后（偏移随账号数增长），读半截就会误判成「不是我」。
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<10))
+	return strings.Contains(string(body), `"accounts"`)
 }
 
 func portFree(port string) bool {
@@ -395,7 +411,7 @@ func shutdown() {
 // 新进程手上没有这个信息，只能按标题猜——而标题会撞车（用户浏览器里正好
 // 开着含「WorkBuddy 管家」的页面），一猜就误伤。
 func focusExisting() bool {
-	cli := &http.Client{Timeout: 3 * time.Second}
+	cli := localClient(3 * time.Second)
 	req, err := http.NewRequest(http.MethodPost, baseURL()+"accounts/api/focus", nil)
 	if err != nil {
 		return false
