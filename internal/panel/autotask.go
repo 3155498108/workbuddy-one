@@ -29,6 +29,7 @@ import (
 	"log"
 	"math/rand/v2"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -634,12 +635,6 @@ func (p *Panel) accountTaskAuto(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "task_code required")
 		return
 	}
-	act := autoActionFor(body.TaskCode)
-	if act == nil {
-		writeErr(w, http.StatusNotImplemented,
-			"该任务需要客户端内交互（无对应接口），无法自动完成；请按任务说明在官方客户端操作")
-		return
-	}
 	// per-account 互斥：同账号的任务动作正在跑（单任务或全量）时直接 409，
 	// 不并发重跑（动作幂等但 expert/skill 系含真实对话，重跑浪费配额）。
 	if !p.tryLockAccount(uid) {
@@ -649,13 +644,21 @@ func (p *Panel) accountTaskAuto(w http.ResponseWriter, r *http.Request) {
 	defer p.unlockAccount(uid)
 	// 前置读取：已完成的任务直接跳过（幂等，不浪费上游调用）。
 	// taskByCode 已双口径（mp 专属码自动回落 mp 列表）。
-	before, err := p.taskByCode(a, act.TaskCode)
+	before, err := p.taskByCode(a, body.TaskCode)
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, "list tasks: "+err.Error())
 		return
 	}
 	if before == nil {
 		writeErr(w, http.StatusNotFound, "该账号没有此任务")
+		return
+	}
+	// 动作解析放到拿到任务实体之后：码表外的 expert_use_* 需要自己的 jump_url
+	// 才能确定召唤哪个专家。
+	act := autoActionForTask(before)
+	if act == nil {
+		writeErr(w, http.StatusNotImplemented,
+			"该任务需要客户端内交互（无对应接口），无法自动完成；请按任务说明在官方客户端操作")
 		return
 	}
 	isMP := isMPTaskCode(act.TaskCode)
@@ -1137,6 +1140,116 @@ func runValorant(p *Panel, a *auth.Auth) (string, error) {
 }
 
 // ---------------------------------------------------------------------------
+// 码表外的「召唤指定专家」任务（expert_use_* 族）通用实现
+// ---------------------------------------------------------------------------
+
+// noAutoTasks 明确不做自动化的任务码——即使带专家 id 也不碰。
+var noAutoTasks = map[string]bool{
+	// 要真实关注公众号并满 24 小时，没有可用接口。
+	"wb_wechat_oa_subscribe_task": true,
+	// 要真实捐款（有资金后果）。
+	"Expert_Philanthropy": true,
+}
+
+// expertFromTask 从任务元信息里解析目标专家（id + 中文名）。
+//
+// jump_url 形如
+//
+//	https://www.workbuddy.cn/work/launch/?deeplink=workbuddy%3A%2F%2Fexperts%3FexpertId%3Dex_xxx
+//
+// 前半段是 URL 编码的 deeplink，解出来就是 workbuddy://experts?expertId=ex_xxx——
+// 这是上游下发的**权威 id**，必须用它：同名的专家在市场里可能有多个版本，实测
+// 「中国电商运营专家」按关键字搜到的第一条是 ex_v0rBWPIPsDYl，而任务指定的是
+// ex_GDl31WahyIH0，按名字猜会召唤错人、事件不计分。
+//
+// 名字只取标题里的「」，用于事件展示字段（name/expertTitle）。取不到就当解析失败，
+// 不去猜——宁可不动，也不要打错专家。
+func expertFromTask(t *upstream.Task) (expertID, name string) {
+	if t == nil {
+		return "", ""
+	}
+	dec, err := url.QueryUnescape(t.JumpURL)
+	if err != nil {
+		dec = t.JumpURL
+	}
+	if i := strings.Index(dec, "expertId="); i >= 0 {
+		rest := dec[i+len("expertId="):]
+		// deeplink 后面可能还挂着 &buddy_type=xxx（编码前后都有可能）。
+		if j := strings.IndexAny(rest, "&#"); j >= 0 {
+			rest = rest[:j]
+		}
+		if strings.HasPrefix(rest, "ex_") {
+			expertID = rest
+		}
+	}
+	if i := strings.Index(t.Title, "「"); i >= 0 {
+		if j := strings.Index(t.Title[i:], "」"); j > 0 {
+			name = t.Title[i+len("「") : i+j]
+		}
+	}
+	return expertID, name
+}
+
+// autoActionForTask 按任务实体解析动作：先查码表，查不到再看它是否自带专家 id。
+//
+// 码表是白名单，新任务码没登记就既不进待办也不显示（用户视角就是「识别不出来」）。
+// 但 expert_use_* 这一族的判据完全一样（召唤指定专家并对话一次），差别只是哪个专家，
+// 而这个差别上游已经写在 jump_url 里了——所以这族不需要逐个登记：解析出 id 就能跑。
+// 新上架的活动专家任务因此可以自动生效。
+func autoActionForTask(t *upstream.Task) *autoAction {
+	if t == nil {
+		return nil
+	}
+	if act := autoActionFor(t.TaskCode); act != nil {
+		return act
+	}
+	if noAutoTasks[t.TaskCode] {
+		return nil
+	}
+	id, name := expertFromTask(t)
+	if id == "" || name == "" {
+		return nil
+	}
+	code, accept := t.TaskCode, t.AcceptStatus
+	return &autoAction{
+		TaskCode: code,
+		Desc:     "召唤「" + name + "」并完成一次对话（专家 id 取自任务 jump_url）",
+		run: func(p *Panel, a *auth.Auth) (string, error) {
+			return runOneExpertTask(p, a, code, id, name, accept)
+		},
+	}
+}
+
+// runOneExpertTask 完成「召唤指定专家并完成一次对话」类任务。
+//
+// 与 useOneExpert 的区别：这里手里只有一个 id 和一个名字（来自任务元信息），
+// 市场对象是尽力补全——事件的关键字段是 id，扩展字段（categories/version/
+// expertType）缺失不影响计分（ex_GDl31WahyIH0 实测最小形态即可点亮）。
+func runOneExpertTask(p *Panel, a *auth.Auth, code, expertID, name, acceptStatus string) (string, error) {
+	e := upstream.MarketExpert{ExpertID: expertID, DisplayNameZH: name, ExpertType: "agent"}
+	// 尽量换成市场里的完整对象，让事件的 type/version 更贴近真实客户端。
+	if list, err := p.cfg.Upstream.MarketExpertSearch(a, name, "agent"); err == nil {
+		for _, x := range list {
+			if x.ExpertID == expertID {
+				e = x
+				break
+			}
+		}
+	}
+	// 没报名的先 accept。不 accept 时上游下发的 progress 是 null，回读拿不到
+	// 「达标」信号，调用方自动领奖那一步就永远触发不了（实测 accept 后变 0/1）。
+	if acceptStatus == "" || acceptStatus == "not_accepted" {
+		if err := p.cfg.Upstream.AcceptTasks(a, []string{code}); err != nil {
+			return "", fmt.Errorf("接受任务: %w", err)
+		}
+	}
+	if err := useOneExpert(p, a, e); err != nil {
+		return "", fmt.Errorf("%s：%w", name, err)
+	}
+	return "已召唤「" + name + "」并完成一次对话", nil
+}
+
+// ---------------------------------------------------------------------------
 // 全量自动完成
 // ---------------------------------------------------------------------------
 
@@ -1196,7 +1309,33 @@ func (p *Panel) runAutoAll(a *auth.Auth) []map[string]any {
 		}
 	}
 
-	for _, act := range autoActions {
+	// 待执行动作 = 码表 + 「码表外但自带专家 id」的任务。后者由 autoActionForTask
+	// 动态生成（expert_use_* 族），否则「一键完成全部」会漏掉这些新任务。
+	// 必须复制到新切片：直接 append(autoActions, ...) 在容量够时会写穿全局表。
+	acts := make([]autoAction, 0, len(autoActions)+4)
+	acts = append(acts, autoActions...)
+	seenCode := map[string]bool{}
+	for _, x := range autoActions {
+		seenCode[x.TaskCode] = true
+	}
+	for _, lister := range []func(*auth.Auth) ([]upstream.Task, error){p.cfg.Upstream.ListTasks, p.cfg.Upstream.ListTasksMP} {
+		tasks, err := lister(a)
+		if err != nil {
+			continue
+		}
+		for i := range tasks {
+			code := tasks[i].TaskCode
+			if seenCode[code] || tasks[i].Claimed {
+				continue
+			}
+			if act := autoActionForTask(&tasks[i]); act != nil {
+				seenCode[code] = true
+				acts = append(acts, *act)
+			}
+		}
+	}
+
+	for _, act := range acts {
 		item := map[string]any{"task_code": act.TaskCode, "desc": act.Desc}
 		before, err := p.taskByCode(a, act.TaskCode)
 		if err != nil {

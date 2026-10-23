@@ -96,3 +96,104 @@ func TestGrowthPendingReachedTargetStillQueued(t *testing.T) {
 		t.Fatal("达标未领取的任务仍应入队（执行后自动领取）")
 	}
 }
+
+// ---- 码表外的「召唤指定专家」任务（expert_use_* 族） ----
+
+// jumpURL 拼一条真实形态的任务跳转链接（前半段是 URL 编码的 deeplink）。
+func jumpURL(expertID string) string {
+	return "https://www.workbuddy.cn/work/launch/?deeplink=workbuddy%3A%2F%2Fexperts%3FexpertId%3D" +
+		expertID + "&buddy_type=workbuddy"
+}
+
+// TestExpertFromTask 从 jump_url 解出权威专家 id、从标题取名字。
+// 必须用上游给的 id：同名专家在市场里可能有多条（实测「中国电商运营专家」搜出来的是
+// 另一个 ex_ id），按名字猜会召唤错人、事件不计分。
+func TestExpertFromTask(t *testing.T) {
+	task := upstream.Task{
+		TaskCode: "expert_use_maidehao",
+		Title:    "体验「中国电商运营专家」",
+		TaskDesc: "在专家页搜索并召唤「中国电商运营专家」，完成一次对话。",
+		JumpURL:  jumpURL("ex_GDl31WahyIH0"),
+	}
+	id, name := expertFromTask(&task)
+	if id != "ex_GDl31WahyIH0" {
+		t.Fatalf("专家 id 解析错误：%q", id)
+	}
+	if name != "中国电商运营专家" {
+		t.Fatalf("专家名解析错误：%q", name)
+	}
+}
+
+// TestExpertFromTaskNoID 没有专家 id 的任务不能被误判成专家任务。
+func TestExpertFromTaskNoID(t *testing.T) {
+	for _, url := range []string{
+		"",
+		"workbuddy://playbook",
+		"https://www.workbuddy.cn/work/launch/?deeplink=workbuddy%3A%2F%2Fplaybook",
+	} {
+		task := upstream.Task{TaskCode: "Sequential_Tasks_7", Title: "体验灵感功能", JumpURL: url}
+		if id, name := expertFromTask(&task); id != "" || name != "" {
+			t.Fatalf("不该解析出专家（url=%q）: id=%q name=%q", url, id, name)
+		}
+	}
+}
+
+// TestExpertFromTaskSuffixParam deeplink 后面还挂着别的参数时，id 不能被带脏。
+func TestExpertFromTaskSuffixParam(t *testing.T) {
+	task := upstream.Task{
+		Title:   "体验「抖音策略师」",
+		JumpURL: "https://www.workbuddy.cn/work/launch/?deeplink=" + "workbuddy%3A%2F%2Fexperts%3FexpertId%3Dex_loEfkMTwHi8v%26from%3Dtask&buddy_type=workbuddy",
+	}
+	id, _ := expertFromTask(&task)
+	if id != "ex_loEfkMTwHi8v" {
+		t.Fatalf("id 带上了尾部参数：%q", id)
+	}
+}
+
+// TestUnknownExpertTaskAutoSupported 码表外的 expert_use_* 任务靠自己的 jump_url
+// 就能可自动化——这是「新活动任务上架后又要手动补码表」的根治点。
+func TestUnknownExpertTaskAutoSupported(t *testing.T) {
+	task := upstream.Task{
+		TaskCode:     "expert_use_bowangwang",
+		Title:        "体验「直播电商教练」",
+		JumpURL:      jumpURL("ex_WoiLzBBnpu8T"),
+		AcceptStatus: "not_accepted",
+	}
+	if autoActionFor(task.TaskCode) != nil {
+		t.Skip("该码已在码表中，本用例针对码表外情形")
+	}
+	act := autoActionForTask(&task)
+	if act == nil {
+		t.Fatal("码表外的 expert_use_* 任务应能被识别（否则面板不显示、无法自动完成）")
+	}
+	if act.run == nil {
+		t.Fatal("动态动作缺 run 实现")
+	}
+	if !growthPending(task) {
+		t.Fatal("码表外的专家任务应进待办")
+	}
+}
+
+// TestNoAutoTasksStayExcluded 明确不做的任务（要真实关注公众号/真实捐款）
+// 即使挂着专家 id 也不能被动态动作捞进来。
+func TestNoAutoTasksStayExcluded(t *testing.T) {
+	for code := range noAutoTasks {
+		task := upstream.Task{TaskCode: code, Title: "体验「某专家」", JumpURL: jumpURL("ex_abc123")}
+		if autoActionForTask(&task) != nil {
+			t.Fatalf("%s 不应生成自动动作", code)
+		}
+		if growthPending(task) {
+			t.Fatalf("%s 不应进待办", code)
+		}
+	}
+}
+
+// TestNilTaskNoAction 空任务不能 panic（扫描时 items 可能为空槽位）。
+func TestNilTaskNoAction(t *testing.T) {
+	if autoActionForTask(nil) != nil {
+		t.Fatal("nil 任务不该解析出动作")
+	}
+	if id, name := expertFromTask(nil); id != "" || name != "" {
+		t.Fatal("nil 任务不该解析出专家")
+	}
+}
