@@ -2,8 +2,10 @@
 //
 // 设计上的几条取舍：
 //
-//  1. 只查、不自动装。替换 exe 必然要重启管家，用户正在切号时被重启会打断操作，
-//     所以自动检查只负责在侧栏亮一个「有新版本」，装不装由用户点。
+//  1. 默认只查、不自动装。替换 exe 必然要重启管家，用户正在切号时被重启会打断操作，
+//     所以自动检查默认只负责在侧栏亮一个「有新版本」，装不装由用户点。想要全自动的
+//     人可以在侧栏把「自动安装」打开（prefs 里的 update_auto_apply），之后每天启动
+//     后查到新版直接换、自己重启。
 //  2. 装的是 zip 不是裸 exe。zip 自带 CRC，解压时能发现下载被截断/被中间页顶掉；
 //     裸 exe 拿不到任何完整性信息。
 //  3. 运行的 exe 允许改名、不允许覆盖。所以换文件的手法是「旧的改名 .old → 新的
@@ -58,6 +60,7 @@ type updateState struct {
 	Applying  bool   `json:"applying"`
 	Error     string `json:"error,omitempty"`
 	AutoCheck bool   `json:"auto_check"`
+	AutoApply bool   `json:"auto_apply"`
 	Feed      string `json:"feed,omitempty"`
 }
 
@@ -194,13 +197,18 @@ func currentUpdateState() updateState {
 	updMu.Unlock()
 	s.Current = appVersion
 	s.AutoCheck = autoCheckEnabled()
+	s.AutoApply = autoApplyEnabled()
 	s.Feed = updateFeedURL()
 	return s
 }
 
 func autoCheckEnabled() bool { return !readPrefs().UpdateCheckOff }
 
+// autoApplyEnabled 查到新版本后是否直接安装（含自动重启）。默认关。
+func autoApplyEnabled() bool { return readPrefs().UpdateAutoApply }
+
 // autoCheckOnce 启动后台静默检查：没开开关、或 24 小时内查过就跳过。
+// 开了「自动安装」时，查到新版本就在这里直接换掉自己并重启——不需要用户点。
 func autoCheckOnce() {
 	if !autoCheckEnabled() {
 		return
@@ -209,9 +217,26 @@ func autoCheckOnce() {
 		time.Since(time.Unix(p.LastUpdateCheck, 0)) < updateAutoGap {
 		return
 	}
-	if st := checkUpdate(true); st.HasUpdate {
-		logf("发现新版本 v%s（当前 v%s）", st.Latest, appVersion)
+	st := checkUpdate(true)
+	if !st.HasUpdate {
+		return
 	}
+	logf("发现新版本 v%s（当前 v%s）", st.Latest, appVersion)
+	if !autoApplyEnabled() {
+		return
+	}
+	// 自动安装：这一步会关窗口、换 exe、重启自己，所以放在后台，别堵住启动流程。
+	logf("自动安装已开启，开始下载 v%s", st.Latest)
+	setApplying(true, "")
+	latest := st.Latest
+	go func() {
+		if err := beginApply(latest); err != nil {
+			logf("自动更新失败：%v", err)
+			setApplying(false, err.Error())
+			return
+		}
+		logf("已下载 v%s，正在替换程序并重启", latest)
+	}()
 }
 
 // ── 版本比较 ────────────────────────────────────────────────────────
@@ -485,6 +510,34 @@ func setApplying(on bool, errMsg string) {
 	updMu.Unlock()
 }
 
+// beginApply 下载当前最新版并安排「关窗口 → 换 exe → 重启」。
+//
+// 同步做下载（失败能立刻返回给调用方），替换放到返回之后——那一步做完进程就没了，
+// 没法再回话。返回时 staged 已落盘、替换任务已在后台排队。
+func beginApply(latest string) error {
+	staged, err := downloadAndStage()
+	if err != nil {
+		return err
+	}
+	go func() {
+		// 留一点时间把响应和提示送出去，再关窗口。
+		time.Sleep(1200 * time.Millisecond)
+		if browser != nil && browser.Process != nil {
+			_ = browser.Process.Kill()
+		}
+		if err := applyStaged(staged); err != nil {
+			logf("自动更新失败：%v", err)
+			setApplying(false, err.Error())
+			return
+		}
+		logf("已更新到 v%s，交给新版本接棒", latest)
+		// 不删 browserProfile：此刻目录还被系统占着，新进程启动时
+		// cleanStaleBrowserProfiles 会收拾。端口随进程退出释放。
+		os.Exit(0)
+	}()
+	return nil
+}
+
 // ── HTTP 接口 ───────────────────────────────────────────────────────
 
 func registerUpdate(mux *http.ServeMux) {
@@ -526,8 +579,7 @@ func registerUpdate(mux *http.ServeMux) {
 		updState.Error = ""
 		updMu.Unlock()
 
-		staged, err := downloadAndStage()
-		if err != nil {
+		if err := beginApply(latest); err != nil {
 			setApplying(false, err.Error())
 			writeErr(w, err.Error())
 			return
@@ -538,23 +590,26 @@ func registerUpdate(mux *http.ServeMux) {
 			"restarting": true,
 			"latest":     latest,
 		})
-
-		go func() {
-			// 留一点时间把响应和提示送出去，再关窗口。
-			time.Sleep(1200 * time.Millisecond)
-			if browser != nil && browser.Process != nil {
-				_ = browser.Process.Kill()
-			}
-			if err := applyStaged(staged); err != nil {
-				logf("自动更新失败：%v", err)
-				setApplying(false, err.Error())
-				return
-			}
-			logf("已更新到 v%s，交给新版本接棒", latest)
-			// 不删 browserProfile：此刻目录还被系统占着，新进程启动时
-			// cleanStaleBrowserProfiles 会收拾。端口随进程退出释放。
-			os.Exit(0)
-		}()
+	})
+	// 打开/关闭「查到就自动安装」。打开后会连重启一起做掉，用户什么都不用点。
+	mux.HandleFunc("POST /accounts/api/update/auto_apply", func(w http.ResponseWriter, r *http.Request) {
+		lastSeen.Store(time.Now().UnixNano())
+		var req struct {
+			Enabled bool `json:"enabled"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		p := readPrefs()
+		p.UpdateAutoApply = req.Enabled
+		// 自动安装依赖自动检查：只开安装在关掉检查的话，永远查不到、也就不会装。
+		if req.Enabled {
+			p.UpdateCheckOff = false
+		}
+		writePrefs(p)
+		msg := "已关闭自动安装，更新改为提示后由你点"
+		if req.Enabled {
+			msg = "已开启自动安装：每天启动后查到新版本会直接更新并重启"
+		}
+		writeJSON(w, map[string]any{"ok": true, "message": msg, "enabled": req.Enabled})
 	})
 	// 关掉/打开每日自动检查。
 	mux.HandleFunc("POST /accounts/api/update/auto", func(w http.ResponseWriter, r *http.Request) {

@@ -49,11 +49,14 @@
   .side-foot .dot.off{background:#c2c7d0}
 
   /* 更新行：默认安静地显示版本号，发现新版本才变蓝并露出按钮 */
-  .upd{display:flex;align-items:center;gap:6px;margin:8px 6px 0;padding:6px 7px;border-radius:8px;background:#f7f9fc;font-size:11.5px;color:#8b929e}
+  .upd{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin:8px 6px 0;padding:6px 7px;border-radius:8px;background:#f7f9fc;font-size:11.5px;color:#8b929e}
   .upd span{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .upd button{flex:0 0 auto;font:inherit;font-size:11px;line-height:1.5;padding:2px 7px;border-radius:6px;border:1px solid #dfe3ea;background:#fff;color:#6b7280;cursor:pointer}
   .upd button:hover{border-color:#c3cbd8;color:var(--text)}
   .upd button:disabled{opacity:.6;cursor:default}
+  .upd .upd-auto{flex:1 0 100%;display:flex;align-items:center;gap:4px;font-size:10.5px;color:#98a0ac;cursor:pointer;user-select:none}
+  .upd .upd-auto input{margin:0;accent-color:var(--accent);cursor:pointer}
+  .upd .upd-auto.on{color:#1d4ed8}
   .upd.hot{background:var(--accent-soft);color:#1d4ed8}
   .upd.hot span{font-weight:650}
   .upd.hot button{background:var(--accent);border-color:var(--accent);color:#fff}
@@ -228,6 +231,9 @@
     <div class="upd" id="updBox">
       <span id="updText">v{{VERSION}}</span>
       <button id="btnUpd">检查更新</button>
+      <label class="upd-auto" id="updAutoBox" title="打开后，每天启动时如果查到新版本会直接安装并重启，不用再点">
+        <input type="checkbox" id="chkAutoApply"><span>自动安装</span>
+      </label>
     </div>
 
     <div class="side-foot">
@@ -498,7 +504,29 @@ function renderUpdate() {
     btn.textContent = btn.disabled ? "检查中…" : "检查更新";
   }
   box.title = has ? `发现新版本 v${upd.latest}，点「更新」自动升级` : "检查是否有新版本";
+  const autoBox = $("#updAutoBox"), chk = $("#chkAutoApply");
+  if (autoBox && chk) {
+    chk.checked = !!(upd && upd.auto_apply);
+    autoBox.classList.toggle("on", chk.checked);
+  }
 }
+
+// 自动安装开关：打开后由服务端每天启动时直接装，界面只负责把状态写回去。
+(async () => {
+  const chk = $("#chkAutoApply");
+  if (!chk) return;
+  chk.onchange = async () => {
+    const want = chk.checked;
+    try {
+      const r = await api("/accounts/api/update/auto_apply", { method: "POST", body: JSON.stringify({ enabled: want }) });
+      toast(r.message || (want ? "已开启自动安装" : "已关闭自动安装"));
+      await loadUpdate();
+    } catch (e) {
+      chk.checked = !want; // 写失败要回滚显示，否则界面在骗人
+      toast("设置失败：" + e.message, true);
+    }
+  };
+})();
 
 $("#btnUpd").onclick = async () => {
   const btn = $("#btnUpd");

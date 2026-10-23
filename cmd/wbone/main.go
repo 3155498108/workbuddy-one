@@ -33,7 +33,7 @@ import (
 
 const (
 	appTitle   = "WorkBuddy 管家"
-	appVersion = "1.0.4"
+	appVersion = "1.0.5"
 )
 
 var browserCandidates = []string{

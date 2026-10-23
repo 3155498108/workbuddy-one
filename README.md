@@ -15,7 +15,7 @@
 
 不想装 Go 自己编译的，直接拿现成的：
 
-**[Releases](https://github.com/3155498108/workbuddy-one/releases)** → `WorkBuddyOne-v1.0.4-win64.zip`（约 4.1 MB）
+**[Releases](https://github.com/3155498108/workbuddy-one/releases)** → `WorkBuddyOne-v1.0.5-win64.zip`（约 4.1 MB）
 
 解压后双击 `WorkBuddyOne.exe` 就能用，**不需要装 Go、Node 或任何运行时**——界面是调用系统自带的
 Edge（或 Chrome）以 `--app` 模式显示，Windows 10/11 上本来就有。首次运行会在同目录自动生成
@@ -78,7 +78,7 @@ Edge（或 Chrome）以 `--app` 模式显示，Windows 10/11 上本来就有。�
 
 ---
 
-## 四个功能
+## 五个功能
 
 ### 1. 账号切换（核心）
 
@@ -119,10 +119,13 @@ WorkBuddy 的对话按账号隔离：`~/.workbuddy/workbuddy.db` 的 `sessions` 
 侧栏底部一直显示当前版本。每天启动后静默查一次有没有新版本，只有查到才变蓝；
 点一下就能下载替换、自动重启，**只换 exe，账号快照、配置、对话记录都不动**。
 
+嫌每次都要点的话，那一行下面有个「自动安装」勾选：打开后就变成真·全自动——
+每天启动时查到新版本直接换、自己重启，窗口关一次再出现，不用管它。
+
 几个刻意做成这样的地方：
 
-- **只查、不自动装**。替换 exe 必须重启管家，你正在切号时被重启会打断操作，
-  所以自动检查只负责提示，装不装由你点。
+- **自动安装默认关**。替换 exe 必须重启管家，你正在切号时被重启会打断操作，
+  所以默认只提示、装不装由你点；愿意让它自己装的人再勾上。
 - **装的是 zip 不是裸 exe**。zip 每条记录都有 CRC，解压时能发现下载被截断或被
   中间页顶掉；裸 exe 拿不到任何完整性信息。取出后还会校验 PE 文件头。
 - **换文件靠改名，不靠覆盖**。Windows 上正在运行的 exe 允许改名、不允许覆盖，
@@ -133,7 +136,31 @@ WorkBuddy 的对话按账号隔离：`~/.workbuddy/workbuddy.db` 的 `sessions` 
 
 更新源默认是 GitHub Release 的 `latest`，连不上（比如没代理）会明确报错、不影响正常使用。
 要换镜像可以设环境变量 `WBONE_UPDATE_FEED` 或在 `data/prefs.json` 里写 `update_feed`
-（格式同 GitHub `releases/latest` 的响应）。
+（格式同 GitHub `releases/latest` 的响应）。自动安装记录在 `update_auto_apply`。
+
+### 5. 任务中心：新任务自动跟上
+
+面板「任务中心」的待办是**白名单**制：每个任务码都要在 `internal/panel/autotask.go`
+的 `autoActions` 表里登记「怎么自动完成」，没登记的码既不进待办、界面上也不显示——
+所以上游一上新活动任务，看起来就像「识别不出来」。
+
+现在补了一条通用规则：`expert_use_*` 这一族（召唤指定专家并完成一次对话）不再逐个登记。
+任务的 `jump_url` 里本来就带着权威专家 id：
+
+```
+…?deeplink=workbuddy%3A%2F%2Fexperts%3FexpertId%3Dex_GDl31WahyIH0
+```
+
+解出来直接用来召唤，标题里的「」提供展示名。**必须用这个 id**：同名专家在市场里可能
+有多条（「中国电商运营专家」按关键字搜到的第一条是另一个 `ex_`），按名字猜会召唤错人、
+事件不计分。新上架的活动专家任务因此可以零改动生效。
+
+不做的两条仍然不做：`wb_wechat_oa_subscribe_task`（要真实关注公众号满 24 小时）、
+`Expert_Philanthropy`（要真实捐款）——即使带专家 id 也不会被捡起来。
+
+另外，`MarketExpertSearch()` 用的是市场的 `keyword` 参数（对应客户端搜索框）。
+别用 `MarketExpertList()` 按名字找专家：它只取推荐序前 20 条，实测目标专家可能在第
+40 页（市场共 1000+ 位）。
 
 ---
 
@@ -159,7 +186,7 @@ go-winres simply --arch amd64 --out wbone --manifest gui \
   --icon app.ico \
   --product-name "WorkBuddy 管家" \
   --file-description "WorkBuddy 客户端账号切换 + API 面板" \
-  --file-version 1.0.4 --product-version 1.0.4 \
+  --file-version 1.0.5 --product-version 1.0.5 \
   --original-filename WorkBuddyOne.exe \
   --copyright "MIT License"
 mv wbone_windows_amd64.syso rsrc.syso

@@ -99,3 +99,44 @@ func TestShellHTMLPlaceholders(t *testing.T) {
 		t.Fatal("界面缺少更新按钮")
 	}
 }
+
+// TestAutoApplyPrefRoundTrip 「自动安装」偏好必须能写能读，且默认是关的。
+// 默认开会让所有人在升级后莫名其妙被重启一次。
+func TestAutoApplyPrefRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	old := exeDir
+	exeDir = dir
+	defer func() { exeDir = old }()
+
+	if autoApplyEnabled() {
+		t.Fatal("没有 prefs.json 时自动安装必须是关的（零值默认）")
+	}
+	p := readPrefs()
+	p.UpdateAutoApply = true
+	writePrefs(p)
+	if !autoApplyEnabled() {
+		t.Fatal("写入后应读到开启状态")
+	}
+	p = readPrefs()
+	p.UpdateAutoApply = false
+	writePrefs(p)
+	if autoApplyEnabled() {
+		t.Fatal("写入关闭后不应再读成开启")
+	}
+}
+
+// TestAutoApplyImpliesCheck 自动安装依赖自动检查：只开安装、关掉检查的话，
+// 永远查不到新版本，开关会静默失效。接口里已经强制把检查打开，这里锁住 prefs 语义。
+func TestAutoApplyImpliesCheck(t *testing.T) {
+	dir := t.TempDir()
+	old := exeDir
+	exeDir = dir
+	defer func() { exeDir = old }()
+
+	writePrefs(prefs{UpdateCheckOff: true, UpdateAutoApply: true})
+	// 组合本身是合法的（两项独立存储），但一旦这样写就没有更新可能——
+	// 接口侧必须把 UpdateCheckOff 清掉。这里验证 autoCheckEnabled 会如实反映。
+	if autoCheckEnabled() {
+		t.Fatal("UpdateCheckOff=true 时 autoCheckEnabled 应为 false")
+	}
+}
