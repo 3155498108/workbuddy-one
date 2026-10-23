@@ -541,7 +541,16 @@ $('accBody').addEventListener('click', async ev => {
   try {
     if (a === 'checkin') {
       const r = await api('accounts/' + encodeURIComponent(u) + '/checkin', { method: 'POST' });
-      toast('签到完成' + (r.credits != null ? '，积分 ' + r.credits + (r.credits_total > 0 ? '/' + r.credits_total : '') : '') + (r.checkin_message ? '（' + r.checkin_message + '）' : ''), 'ok');
+      const tail = r.credits != null ? '，积分 ' + r.credits + (r.credits_total > 0 ? '/' + r.credits_total : '') : '';
+      // checkin_done=false 时绝不能报「签到完成」。此前 401 会把网关的 HTML 错误页
+      // 整段拼进「签到完成（…）」，看起来像成功了，实际一次都没签上。
+      if (r.checkin_done) {
+        toast('签到完成' + tail + (r.checkin_message ? '（' + r.checkin_message + '）' : ''), 'ok');
+      } else if (r.enterprise) {
+        toast('企业账号无签到体系（额度已刷新）' + tail, 'ok');
+      } else {
+        toast('签到未完成' + tail + (r.checkin_message ? '：' + r.checkin_message : ''), 'err');
+      }
     } else if (a === 'balance') {
       const r = await api('accounts/' + encodeURIComponent(u) + '/balance', { method: 'POST' });
       toast('余额已更新：' + r.credits + (r.credits_total > 0 ? ' / ' + r.credits_total : ''), 'ok');

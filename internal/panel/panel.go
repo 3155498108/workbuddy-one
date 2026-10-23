@@ -12,6 +12,7 @@ package panel
 
 import (
 	"encoding/json"
+	"errors"
 	"log"
 	"net/http"
 	"os"
@@ -524,6 +525,17 @@ func (p *Panel) accountCheckin(w http.ResponseWriter, r *http.Request) {
 		checkinMsg = "企业账号无签到体系（已跳过签到，仅刷新额度）"
 	} else if err := p.cfg.Upstream.DailyCheckin(a); err != nil {
 		checkinMsg = err.Error() // "今天已签到"等业务错误照常查余额
+		// 登录态被上游作废（billing 网关直接 401，refresh 也拒绝 12153）：再点多少次都是
+		// 同一个 401，必须说清处置办法。此前这里原样透出网关的 HTML 401 页，界面
+		// 还顶着「签到完成」四个字，用户完全不知道该去重登。
+		var ue *upstream.Error
+		if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead {
+			checkinMsg = "登录已失效（refresh token 被上游作废），请重新登录该账号后再签到"
+			// 刻意不调 Pool.NoteSessionDead：手动签到是人在看结果，不该产生「连续 N 次
+			// 自动禁用」这种终态副作用——否则用户连点三次试探就会被关进禁用态。
+			// 连续计数留给 keepalive（无人干预的每日自检，那时禁用才是对的）。
+			log.Printf("panel: checkin uid=%s 登录态已失效（session dead）", uid)
+		}
 		// 幂等拒绝同样是「今日已签」，标记后按钮显示「已签」。
 		if upstream.IsAlreadyCheckin(err) {
 			p.cfg.Pool.NoteCheckinDone(uid)

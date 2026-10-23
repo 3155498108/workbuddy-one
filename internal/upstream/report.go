@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log"
 	"net/http"
 	"time"
 
@@ -44,7 +45,28 @@ func (c *Client) billingJSON(a *auth.Auth, method, path string, body any) (json.
 // billingMeterJSON 仅对 /billing/meter 族端点（get-user-resource / daily-checkin）
 // 按 realm 走双路径 fallback：global 先无 /v2 前缀，ErrNotFound 时二次换有 /v2 前缀
 // （上游新旧路径分叉）；cn 单路径（有 /v2）现状不变。仅 global realm 才有多路径。
+//
+// 401 自愈：网关层 401（无业务信封的 HTML/空体，见 Classify）说明 access token 已被
+// 服务端吊销，但 refresh token 往往还活着（别处刷新轮换、客户端重启换号等）。此时
+// 刷一次再重试就能自愈，不必等用户手动重登。刷新失败时返回**刷新的错误**——12153
+// 明确指向「refresh 也作废，只能重登」，比把一坨 401 HTML 抛给界面有用得多。
 func (c *Client) billingMeterJSON(a *auth.Auth, paths []string, method string, body any) (json.RawMessage, error) {
+	data, err := c.billingMeterAttempt(a, paths, method, body)
+	if err == nil || !isAuthExpired(err) {
+		return data, err
+	}
+	if rerr := c.RefreshToken(a); rerr != nil {
+		return nil, rerr
+	}
+	if serr := a.SaveAtomic(); serr != nil {
+		log.Printf("WARN: [upstream] 401 后刷新 token 落盘失败 uid=%s: %v", a.UID, serr)
+	}
+	return c.billingMeterAttempt(a, paths, method, body)
+}
+
+// billingMeterAttempt 是 billingMeterJSON 的单轮执行：按 paths 顺序请求，
+// 仅 ErrNotFound（路径不存在）才换下一条路径。
+func (c *Client) billingMeterAttempt(a *auth.Auth, paths []string, method string, body any) (json.RawMessage, error) {
 	var lastErr error
 	for i, path := range paths {
 		data, err := c.billingJSON(a, method, path, body)
@@ -52,13 +74,23 @@ func (c *Client) billingMeterJSON(a *auth.Auth, paths []string, method string, b
 			return data, nil
 		}
 		lastErr = err
-		// 仅 404 换路径（路径不存在才值得 fallback）；其他错误直接返回。
 		var ue *Error
 		if !errors.As(err, &ue) || ue.Kind != ErrNotFound || i == len(paths)-1 {
 			return nil, err
 		}
 	}
 	return nil, lastErr
+}
+
+// isAuthExpired 报告 err 是否是「网关层 401」——无业务信封的 HTTP 401（HTML 网关页 /
+// 空体）。这类错误值得先刷一次 token 再重试，而不是直接判死。
+// 带业务信封的 401（code 12153 等）在自己的语义层已有结论，走到这里刷新只会白打一次。
+func isAuthExpired(err error) bool {
+	var ue *Error
+	if !errors.As(err, &ue) {
+		return false
+	}
+	return ue.Status == http.StatusUnauthorized && !hasBusinessEnvelope(ue.Msg)
 }
 
 // billingRetryDelay 签到/余额等维护类计费调用瞬时错误重试的间隔基数。

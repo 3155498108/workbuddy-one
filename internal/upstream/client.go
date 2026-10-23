@@ -507,6 +507,17 @@ func Classify(status int, body string) ErrKind {
 			return ErrSessionDead
 		}
 	}
+	// HTTP 401 且**无业务信封**（HTML 网关页 / 空体）：请求在网关层（APISIX/openresty）
+	// 就被挡下，Authorization 根本没进到业务层——这是 access token 已被服务端吊销的
+	// 形态（JWT 的 exp 还没到也会发生：别处刷新轮换掉旧 access、安全策略踢下线、改密码）。
+	//
+	// 归 ErrSessionDead 而不是落到下方通用 4xx 的 ErrClient：ErrClient 只换号不罚，
+	// 坏号留在池内反复被选中，且没有任何恢复路径（实测：签到每天撞同一坨 401 HTML，
+	// 池状态里 credits 仍是上次的值、disabled=false，界面完全看不出账号已经废了）。
+	// 带业务信封的 401（如 code 12153）已在上方 marker 层命中，不受本层影响。
+	if status == http.StatusUnauthorized && !hasBusinessEnvelope(body) {
+		return ErrSessionDead
+	}
 	for _, m := range accountFaultMarkers {
 		if strings.Contains(lower, strings.ToLower(m)) || strings.Contains(body, m) {
 			return ErrAccountFault
@@ -872,7 +883,7 @@ func (c *Client) doJSON(req *http.Request) (json.RawMessage, error) {
 	}
 	if resp.StatusCode >= 400 {
 		kind := Classify(resp.StatusCode, string(raw))
-		return nil, &Error{Kind: kind, Status: resp.StatusCode, Msg: truncate(string(raw), 200)}
+		return nil, &Error{Kind: kind, Status: resp.StatusCode, Msg: errBodySummary(string(raw))}
 	}
 	var env apiEnvelope
 	if err := json.Unmarshal(raw, &env); err != nil {
@@ -1066,7 +1077,7 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 			if kind == ErrNone {
 				return nil, resp.StatusCode, raw, nil
 			}
-			ue := &Error{Kind: kind, Status: resp.StatusCode, Msg: truncate(string(raw), 200)}
+			ue := &Error{Kind: kind, Status: resp.StatusCode, Msg: errBodySummary(string(raw))}
 			if d, ok := ParseRetryAfter(resp.Header); ok {
 				ue.RetryAfter = d
 			}
@@ -2200,4 +2211,39 @@ func IsAlreadyCheckin(err error) bool {
 
 func truncate(s string, n int) string {
 	return logfmt.Truncate(s, n)
+}
+
+// errBodySummary 把错误响应体压成可读单行，供 Error.Msg 使用。
+//
+// 为什么需要：网关层的 401/403 返回的是 APISIX/openresty 的 HTML 拦截页（几百字节
+// 标签 + 外链）。原样塞进 Msg 的后果是——日志一行变十行、界面 toast 变成一坨 <html>，
+// 而真正有用的信息（"401 Authorization Required"）反而被淹没。
+// 非 HTML 的（正常业务 JSON 信封）保持原有 truncate 语义，错误码/文案一个字符不动。
+func errBodySummary(body string) string {
+	s := strings.TrimSpace(body)
+	if s == "" {
+		return "(空响应体)"
+	}
+	if s[0] != '<' {
+		return truncate(s, 200)
+	}
+	// 依次尝试 <title> / <h1> 的文本，都没有就取正文前 80 字符。
+	text := ""
+	for _, tag := range []string{"title", "h1"} {
+		if i := strings.Index(s, "<"+tag+">"); i >= 0 {
+			rest := s[i+len(tag)+2:]
+			if j := strings.Index(rest, "</"+tag+">"); j > 0 {
+				text = strings.TrimSpace(rest[:j])
+				break
+			}
+		}
+	}
+	if text == "" {
+		text = truncate(strings.Join(strings.Fields(s), " "), 80)
+	}
+	text = strings.Join(strings.Fields(text), " ")
+	if len(text) > 80 {
+		text = text[:80] + "…"
+	}
+	return "网关返回 HTML 拦截页（" + text + "），请求未到达业务层"
 }
