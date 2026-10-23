@@ -17,7 +17,9 @@ package main
 
 import (
 	"archive/zip"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -28,6 +30,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -43,6 +46,22 @@ const (
 	updateAutoGap     = 24 * time.Hour
 	updateCacheGap    = 5 * time.Minute
 	updateHandoffEnv  = "WBONE_UPDATE_HANDOFF"
+
+	// updateHeaderTimeout 下载请求等响应头的上限（连不上/被拦要快速失败，别干等）。
+	updateHeaderTimeout = 20 * time.Second
+)
+
+// 下面几个做成 var 而不是 const，是为了让测试能把「25 秒」压成毫秒级
+// 去验证停滞检测和重试，否则跑一次测试要等半分钟。
+var (
+	// updateStallTimeout 下载期间「没有收到任何新字节」的上限。
+	// 这里必须看进展、不能看总时长：GitHub 的资产走 objects.githubusercontent.com，
+	// 国内经代理常见 100~300 KB/s，4 MB 包要几十秒。之前和查版本共用一个
+	// Timeout=20s 的 client，等于给整个下载压了 20 秒死线，慢一点就报
+	// 「context deadline exceeded ... while reading body」——v1.0.3 起的更新失败全是它。
+	updateStallTimeout = 25 * time.Second
+	updateTries        = 3
+	updateRetryWait    = 3 * time.Second
 )
 
 // updateState 是给界面看的更新状态。检查结果缓存在内存里，
@@ -55,6 +74,7 @@ type updateState struct {
 	Page      string `json:"page,omitempty"`
 	Asset     string `json:"asset,omitempty"`
 	AssetSize int64  `json:"asset_size,omitempty"`
+	GotBytes  int64  `json:"got_bytes,omitempty"`
 	CheckedAt string `json:"checked_at,omitempty"`
 	Checking  bool   `json:"checking"`
 	Applying  bool   `json:"applying"`
@@ -84,6 +104,9 @@ var (
 	updState    = updateState{Current: appVersion}
 	updAssetURL string
 	updChecked  time.Time
+	// updGot 本次下载已落盘的字节数。用原子变量单独存，是因为 io.Copy 的
+	// 循环里每块都要更新，走 updMu 会把状态接口拖慢。
+	updGot atomic.Int64
 )
 
 // ── 查询 ────────────────────────────────────────────────────────────
@@ -98,10 +121,25 @@ func updateFeedURL() string {
 	return "https://api.github.com/repos/" + updateRepo + "/releases/latest"
 }
 
-// updateClient 更新请求要访问 GitHub，**必须**走系统代理通道
-// （国内直连 api.github.com 基本不通），所以这里用默认 Transport，
-// 与 localClient() 刻意相反——那个是给自己人的，这个是给外网的。
+// updateClient 查 Release 元数据的 client。这一步只是拿几 KB 的 JSON，
+// 20 秒总超时正好——连不上就该早点报错。
+//
+// **不要拿它去下载安装包**：Client.Timeout 计的是「整个请求」的时长（含读完 body），
+// 慢速下载会被它从中间掐断。下载走 updateDownloadClient。
 func updateClient() *http.Client { return &http.Client{Timeout: 20 * time.Second} }
+
+// updateDownloadClient 下载安装包专用：不设总时长，改由两件事兜底——
+// 响应头由 Transport.ResponseHeaderTimeout 管，读到一半卡住由 downloadAttempt
+// 里的停滞检测管。这样「慢但活着」的下载能一直跑完，「卡死」的能在 25 秒内死掉。
+func updateDownloadClient() *http.Client {
+	tr, ok := http.DefaultTransport.(*http.Transport)
+	if !ok {
+		return &http.Client{Timeout: 0}
+	}
+	cp := tr.Clone()
+	cp.ResponseHeaderTimeout = updateHeaderTimeout
+	return &http.Client{Timeout: 0, Transport: cp}
+}
 
 func fetchRelease() (*ghRelease, error) {
 	req, err := http.NewRequest(http.MethodGet, updateFeedURL(), nil)
@@ -199,6 +237,9 @@ func currentUpdateState() updateState {
 	s.AutoCheck = autoCheckEnabled()
 	s.AutoApply = autoApplyEnabled()
 	s.Feed = updateFeedURL()
+	if s.Applying {
+		s.GotBytes = updGot.Load()
+	}
 	return s
 }
 
@@ -325,13 +366,9 @@ func downloadAndStage() (string, error) {
 	ensureDir(dir)
 	zipPath := filepath.Join(dir, asset)
 
-	if err := downloadFile(url, zipPath, updateMaxZipBytes); err != nil {
+	updGot.Store(0)
+	if err := downloadFile(url, zipPath, updateMaxZipBytes, want); err != nil {
 		return "", err
-	}
-	if want > 0 {
-		if st, err := os.Stat(zipPath); err == nil && st.Size() != want {
-			return "", fmt.Errorf("下载不完整（%d/%d 字节），请重试", st.Size(), want)
-		}
 	}
 	staged, err := extractExe(zipPath, dir)
 	if err != nil {
@@ -342,35 +379,199 @@ func downloadAndStage() (string, error) {
 	return staged, nil
 }
 
-func downloadFile(url, dst string, limit int64) error {
-	req, err := http.NewRequest(http.MethodGet, url, nil)
+// ── 下载 ────────────────────────────────────────────────────────────
+
+// downloadFatal 标记「重试也没意义」的失败：HTTP 4xx、包结构不对、
+// 体积注定超上限。其余（连接断、卡住、下不全）都值得再来一次。
+type downloadFatal struct{ err error }
+
+func (e *downloadFatal) Error() string { return e.err.Error() }
+func (e *downloadFatal) Unwrap() error { return e.err }
+
+func fatalDownload(format string, a ...any) error {
+	return &downloadFatal{fmt.Errorf(format, a...)}
+}
+
+func downloadRetriable(err error) bool {
+	var f *downloadFatal
+	return !errors.As(err, &f)
+}
+
+// downloadFile 把安装包下到 dst。
+//
+// 三条原则，对应以前踩过的坑：
+//  1. 不设总时长。慢速下载是合法的，只有「停止收到数据」才算失败。
+//  2. 断了续传。GitHub 资产走 objects.githubusercontent.com，国内一次下完
+//     4 MB 并不容易，整包重来纯属浪费。
+//  3. 字节数对不上就再来一轮。半包解包会以「安装包里没有 exe」这种
+//     莫名其妙的形式暴露，不如在下载层就拦住。
+func downloadFile(url, dst string, limit, want int64) error {
+	var lastErr error
+	for try := 1; try <= updateTries; try++ {
+		if try > 1 {
+			logf("下载未完成（%v），%v 后重试第 %d 次", lastErr, updateRetryWait, try-1)
+			time.Sleep(updateRetryWait)
+		}
+		err := downloadOnce(url, dst, limit, want)
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		if !downloadRetriable(err) {
+			_ = os.Remove(dst)
+			return err
+		}
+	}
+	_ = os.Remove(dst) // 残包留着会被下一次当成续传起点，反而更坏
+	return lastErr
+}
+
+func downloadOnce(url, dst string, limit, want int64) error {
+	have := int64(0)
+	if st, err := os.Stat(dst); err == nil {
+		have = st.Size()
+	}
+	// 已有的部分不可能比目标还大——要么上次下坏了，要么尺寸对不上，一律重来。
+	if have > limit || (want > 0 && have > want) {
+		_ = os.Remove(dst)
+		have = 0
+	}
+	if want > 0 && have == want {
+		return nil // 上次其实已经下全了
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return err
+		return &downloadFatal{err}
 	}
 	req.Header.Set("User-Agent", "WorkBuddyOne/"+appVersion)
-	resp, err := updateClient().Do(req)
+	if have > 0 {
+		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", have))
+	}
+	resp, err := updateDownloadClient().Do(req)
 	if err != nil {
-		return fmt.Errorf("下载失败：%w", err)
+		return fmt.Errorf("连接下载地址失败：%w", err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("下载失败：HTTP %d", resp.StatusCode)
+
+	switch resp.StatusCode {
+	case http.StatusPartialContent:
+		// 续传，have 保持
+	case http.StatusOK:
+		have = 0 // 服务器不认 Range（或被代理改写成 200），只能从头写
+	case http.StatusRequestedRangeNotSatisfiable:
+		return nil // 手上的已经覆盖全部内容
+	default:
+		return fatalDownload("下载失败：HTTP %d", resp.StatusCode)
 	}
-	f, err := os.Create(dst)
+	// 拿到的明显不是安装包（错误页、跳转页通常只有几百字节），别浪费时间重试。
+	if want > 0 && resp.ContentLength > 0 && resp.ContentLength < want/2 {
+		return fatalDownload("下载地址返回的内容只有 %d 字节（应为 %d），可能被网络拦截了",
+			resp.ContentLength, want)
+	}
+
+	f, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {
-		return fmt.Errorf("写入临时文件失败：%w", err)
+		return &downloadFatal{fmt.Errorf("写入临时文件失败：%w", err)}
 	}
-	defer f.Close()
-	n, err := io.Copy(f, io.LimitReader(resp.Body, limit))
-	if err != nil {
-		_ = os.Remove(dst)
-		return fmt.Errorf("下载中断：%w", err)
+	if have == 0 {
+		if err := f.Truncate(0); err != nil {
+			f.Close()
+			return &downloadFatal{fmt.Errorf("写入临时文件失败：%w", err)}
+		}
 	}
-	if n <= 0 {
-		_ = os.Remove(dst)
-		return fmt.Errorf("下载到 0 字节")
+	if _, err := f.Seek(have, io.SeekStart); err != nil {
+		f.Close()
+		return &downloadFatal{fmt.Errorf("写入临时文件失败：%w", err)}
+	}
+
+	guard, stopGuard := newStallGuard(resp.Body, updateStallTimeout, cancel)
+	n, cerr := io.Copy(f, io.LimitReader(guard, limit-have))
+	stopGuard()
+	got := have + n
+	updGot.Store(got)
+
+	// 先 Sync 再 Close：换 exe 之前数据必须真的落盘。
+	if serr := f.Sync(); cerr == nil && serr != nil {
+		cerr = serr
+	}
+	if clErr := f.Close(); cerr == nil && clErr != nil {
+		cerr = clErr
+	}
+
+	if guard.hit.Load() {
+		return fmt.Errorf("下载卡住了：%d 秒没有收到任何数据（已下 %d/%d 字节）",
+			int(updateStallTimeout/time.Second), got, want)
+	}
+	if cerr != nil {
+		return fmt.Errorf("下载中断：%w", cerr)
+	}
+	if got >= limit && (want <= 0 || got < want) {
+		return fatalDownload("安装包超过 %d MB 上限，已放弃", limit>>20)
+	}
+	if want > 0 && got < want {
+		return fmt.Errorf("下载不完整（%d/%d 字节）", got, want)
 	}
 	return nil
+}
+
+// stallGuard 给下载流加「停滞检测」。
+//
+// 为什么不用 http.Client.Timeout：那是整个请求的总时长，慢速但活着的下载会被
+// 它从中间掐断，正是 v1.0.3 起更新失败的原因。Transport 也没有「读停滞」这个
+// 粒度，所以自己盯最后一次收到数据的时刻。
+type stallGuard struct {
+	r    io.Reader
+	hit  atomic.Bool
+	last atomic.Int64
+}
+
+func newStallGuard(r io.Reader, stall time.Duration, onStall func()) (*stallGuard, func()) {
+	g := &stallGuard{r: r}
+	g.last.Store(time.Now().UnixNano())
+	stop := make(chan struct{})
+	go func() {
+		t := time.NewTicker(time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-t.C:
+				if time.Since(time.Unix(0, g.last.Load())) > stall {
+					g.hit.Store(true)
+					onStall() // 掐掉请求，让 io.Copy 立刻返回
+					return
+				}
+			}
+		}
+	}()
+	var once sync.Once
+	return g, func() { once.Do(func() { close(stop) }) }
+}
+
+func (g *stallGuard) Read(p []byte) (int, error) {
+	n, err := g.r.Read(p)
+	if n > 0 {
+		g.last.Store(time.Now().UnixNano())
+	}
+	return n, err
+}
+
+// ── 解包 ────────────────────────────────────────────────────────────
+
+// zipBase 取 zip 条目里的文件名。
+//
+// 必须先把反斜杠换成斜杠：Windows 上不少打包工具（旧版 PowerShell 的
+// Compress-Archive 是典型）用 `\` 当路径分隔符，而 path.Base 只认 `/`，
+// 于是 "dir\WorkBuddyOne.exe" 会被当成一个「名字里带反斜杠的文件」，
+// 和 WorkBuddyOne.exe 永远匹配不上——现象就是包明明是好的，却报
+// 「安装包里没有 WorkBuddyOne.exe」。
+func zipBase(name string) string {
+	return path.Base(strings.ReplaceAll(name, `\`, "/"))
 }
 
 // extractExe 从 zip 里取出 WorkBuddyOne.exe。zip 每条记录都有 CRC，
@@ -378,42 +579,95 @@ func downloadFile(url, dst string, limit int64) error {
 func extractExe(zipPath, dir string) (string, error) {
 	zr, err := zip.OpenReader(zipPath)
 	if err != nil {
-		return "", fmt.Errorf("安装包损坏或不是 zip：%w", err)
+		return "", fatalDownload("安装包损坏或不是 zip：%w", err)
 	}
 	defer zr.Close()
 
+	// 第一轮按名字找；顺带记下所有 .exe，供兜底用。
+	var target *zip.File
+	var exes []*zip.File
 	for _, f := range zr.File {
-		if f.FileInfo().IsDir() || path.Base(f.Name) != updateExeName {
+		if f.FileInfo().IsDir() {
 			continue
 		}
-		rc, err := f.Open()
-		if err != nil {
-			return "", fmt.Errorf("读取安装包失败：%w", err)
+		base := zipBase(f.Name)
+		if strings.EqualFold(base, updateExeName) {
+			target = f
+			break
 		}
-		tmp := filepath.Join(dir, updateExeName+".new")
-		out, err := os.Create(tmp)
-		if err != nil {
-			rc.Close()
-			return "", err
+		if strings.EqualFold(path.Ext(base), ".exe") {
+			exes = append(exes, f)
 		}
-		n, cerr := io.Copy(out, rc)
-		rc.Close()
-		out.Close()
-		if cerr != nil {
-			_ = os.Remove(tmp)
-			return "", fmt.Errorf("解压失败：%w", cerr)
-		}
-		if n < updateMinExeBytes {
-			_ = os.Remove(tmp)
-			return "", fmt.Errorf("安装包里的程序只有 %d 字节，不完整", n)
-		}
-		if err := checkPEFile(tmp); err != nil {
-			_ = os.Remove(tmp)
-			return "", err
-		}
-		return tmp, nil
 	}
-	return "", fmt.Errorf("安装包里没有 %s", updateExeName)
+	// 兜底：包里只有一个 exe 就用它。用户重新打包、顺手改了 exe 名的
+	// 情况不该让更新彻底卡死——PE 头校验还在后面把关。
+	if target == nil && len(exes) == 1 {
+		target = exes[0]
+		logf("安装包里没有 %s，但只有一个 exe（%s），按它处理", updateExeName, zipBase(target.Name))
+	}
+	if target == nil {
+		if len(exes) > 1 {
+			names := make([]string, 0, len(exes))
+			for _, f := range exes {
+				names = append(names, zipBase(f.Name))
+			}
+			return "", fatalDownload("安装包里有多个 exe（%s），不确定该用哪个", strings.Join(names, "、"))
+		}
+		return "", fatalDownload("安装包里没有 %s（包内只有：%s）", updateExeName, zipListing(zr))
+	}
+
+	rc, err := target.Open()
+	if err != nil {
+		return "", fmt.Errorf("读取安装包失败：%w", err)
+	}
+	defer rc.Close()
+
+	tmp := filepath.Join(dir, updateExeName+".new")
+	out, err := os.Create(tmp)
+	if err != nil {
+		return "", &downloadFatal{err}
+	}
+	n, cerr := io.Copy(out, rc)
+	if cerr == nil {
+		cerr = out.Sync()
+	}
+	if clErr := out.Close(); cerr == nil {
+		cerr = clErr
+	}
+	if cerr != nil {
+		_ = os.Remove(tmp)
+		return "", fmt.Errorf("解压失败：%w", cerr)
+	}
+	if n < updateMinExeBytes {
+		_ = os.Remove(tmp)
+		return "", fmt.Errorf("安装包里的程序只有 %d 字节，不完整", n)
+	}
+	if err := checkPEFile(tmp); err != nil {
+		_ = os.Remove(tmp)
+		return "", err
+	}
+	return tmp, nil
+}
+
+// zipListing 把包内条目压成一行人话，塞进报错里。
+// 以后再遇到「包里没找到 exe」，日志本身就能说明拿到的是什么。
+func zipListing(zr *zip.ReadCloser) string {
+	const max = 6
+	names := make([]string, 0, max)
+	for _, f := range zr.File {
+		if f.FileInfo().IsDir() {
+			continue
+		}
+		if len(names) == max {
+			names = append(names, "…")
+			break
+		}
+		names = append(names, zipBase(f.Name))
+	}
+	if len(names) == 0 {
+		return "空包"
+	}
+	return strings.Join(names, "、")
 }
 
 // checkPEFile 确认拿到的是一个 Windows 可执行文件，而不是错误页或残缺文件。

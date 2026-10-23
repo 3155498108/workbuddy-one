@@ -15,7 +15,7 @@
 
 不想装 Go 自己编译的，直接拿现成的：
 
-**[Releases](https://github.com/3155498108/workbuddy-one/releases)** → `WorkBuddyOne-v1.0.5-win64.zip`（约 4.1 MB）
+**[Releases](https://github.com/3155498108/workbuddy-one/releases)** → `WorkBuddyOne-v1.0.6-win64.zip`（约 4.1 MB）
 
 解压后双击 `WorkBuddyOne.exe` 就能用，**不需要装 Go、Node 或任何运行时**——界面是调用系统自带的
 Edge（或 Chrome）以 `--app` 模式显示，Windows 10/11 上本来就有。首次运行会在同目录自动生成
@@ -126,6 +126,13 @@ WorkBuddy 的对话按账号隔离：`~/.workbuddy/workbuddy.db` 的 `sessions` 
 
 - **自动安装默认关**。替换 exe 必须重启管家，你正在切号时被重启会打断操作，
   所以默认只提示、装不装由你点；愿意让它自己装的人再勾上。
+- **下载按「有没有进展」判定失败，不设总时长**。`http.Client.Timeout` 计的是整个
+  请求（含读完 body），慢速下载会被它从中间掐断——v1.0.3~v1.0.5 更新失败报的
+  `context deadline exceeded ... while reading body` 全是这个。现在只有「连续 25 秒
+  一个新字节都没进来」才算卡死，断线还会带 `Range` 从断点续传（最多 3 次）。
+- **解包认文件名兼容反斜杠**。`path.Base` 只认 `/`，而部分 Windows 打包工具用 `\`
+  当分隔符，包完全正常却被判成「安装包里没有 WorkBuddyOne.exe」。现在两种分隔符
+  都认、大小写不敏感，包里只有一个 exe 时还会兜底采用。
 - **装的是 zip 不是裸 exe**。zip 每条记录都有 CRC，解压时能发现下载被截断或被
   中间页顶掉；裸 exe 拿不到任何完整性信息。取出后还会校验 PE 文件头。
 - **换文件靠改名，不靠覆盖**。Windows 上正在运行的 exe 允许改名、不允许覆盖，
@@ -186,7 +193,7 @@ go-winres simply --arch amd64 --out wbone --manifest gui \
   --icon app.ico \
   --product-name "WorkBuddy 管家" \
   --file-description "WorkBuddy 客户端账号切换 + API 面板" \
-  --file-version 1.0.5 --product-version 1.0.5 \
+  --file-version 1.0.6 --product-version 1.0.6 \
   --original-filename WorkBuddyOne.exe \
   --copyright "MIT License"
 mv wbone_windows_amd64.syso rsrc.syso

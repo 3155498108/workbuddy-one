@@ -491,9 +491,15 @@ function renderUpdate() {
   const cur = (upd && upd.current) || CUR_VER;
   const has = !!(upd && upd.has_update);
   box.classList.toggle("hot", has);
+  // 下载进度：apply 期间服务端在往 got_bytes 里累加，不画出来用户会以为卡死。
+  const pct = (has && upd.applying && upd.asset_size > 0)
+    ? Math.max(0, Math.min(100, Math.round((upd.got_bytes || 0) / upd.asset_size * 100)))
+    : -1;
   if (has) {
-    txt.textContent = `v${cur} → v${upd.latest}`;
-    btn.textContent = btn.disabled ? "更新中…" : "更新";
+    txt.textContent = pct >= 0
+      ? `v${cur} → v${upd.latest} · 下载 ${pct}%`
+      : `v${cur} → v${upd.latest}`;
+    btn.textContent = pct >= 0 ? `${pct}%` : (btn.disabled ? "更新中…" : "更新");
   } else if (upd && upd.applying) {
     txt.textContent = `正在更新到 v${upd.latest}`;
     btn.textContent = "更新中…";
@@ -545,8 +551,17 @@ $("#btnUpd").onclick = async () => {
       return;
     }
     btn.textContent = "下载中…";
+    // apply 是同步下载，请求会一直挂到下载结束。单独起一个轻量轮询把进度画出来，
+    // 否则慢网下用户只看到「下载中…」三个字，很容易以为卡死又去点一次。
+    const tick = setInterval(async () => {
+      try {
+        const r = await fetch("/accounts/api/update", { cache: "no-store" });
+        if (r.ok) { upd = await r.json(); renderUpdate(); }
+      } catch (e) { /* 轮询失败无所谓，正式结果以 apply 的返回为准 */ }
+    }, 700);
     try {
       const d = await api("/accounts/api/update/apply", {});
+      clearInterval(tick);
       toast(d.message || "正在更新，管家即将重启");
       setTimeout(() => {
         document.body.innerHTML =
@@ -555,6 +570,7 @@ $("#btnUpd").onclick = async () => {
            </div>`;
       }, 700);
     } catch (e) {
+      clearInterval(tick);
       toast("更新失败：" + e.message, true);
       btn.disabled = false;
       loadUpdate();
