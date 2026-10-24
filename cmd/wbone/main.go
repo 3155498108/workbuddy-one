@@ -33,7 +33,7 @@ import (
 
 const (
 	appTitle   = "WorkBuddy 管家"
-	appVersion = "1.0.9"
+	appVersion = "1.0.10"
 )
 
 var browserCandidates = []string{
@@ -53,6 +53,8 @@ var (
 	apiKey         string // 注入页面，供面板 iframe 自动登录
 	appPort        string
 	stopAll        context.CancelFunc
+	winBootAt      time.Time // 浏览器进程被拉起的时刻，用于启动宽限期
+	winBeatLogged  bool      // 「靠心跳救回来」只记一次日志，别每 3 秒刷一行
 )
 
 func mustExeDir() string {
@@ -238,6 +240,8 @@ func openWindow(url string) {
 		)
 		if err := cmd.Start(); err == nil {
 			browser = cmd
+			winBootAt = time.Now()
+			logf("窗口进程已拉起：pid=%d", cmd.Process.Pid)
 			// 关进 Job：管家无论怎么退出（正常关闭 / 强杀 / 崩溃），
 			// 这个窗口都会被系统一起收走，不会留成孤儿。
 			if jerr := bindBrowserToJob(cmd.Process.Pid); jerr != nil {
@@ -397,13 +401,11 @@ func shutdown() {
 	if stopAll != nil {
 		stopAll()
 	}
-	// 只结束自己拉起的那个浏览器进程，Job 会把它的子进程一并收走。
+	// 只结束自己拉起的那个浏览器进程树（走 Job，relaunch 出来的新进程也一并收走）。
 	// 这里刻意不再遍历窗口发 WM_CLOSE：标题相同不代表窗口是我们的，
 	// 用户浏览器里开着同名页面时，那一下会直接关掉用户自己的标签页。
-	if browser != nil && browser.Process != nil {
-		_ = browser.Process.Kill()
-		time.Sleep(400 * time.Millisecond)
-	}
+	killBrowser()
+	time.Sleep(400 * time.Millisecond)
 	if browserProfile != "" {
 		_ = os.RemoveAll(browserProfile)
 	}
@@ -431,6 +433,25 @@ func focusExisting() bool {
 	}
 	_ = json.NewDecoder(resp.Body).Decode(&out)
 	return out.Found
+}
+
+// waitInstanceGone 等既有实例让出端口（它正在关窗口的收尾阶段，最多二十秒）。
+//
+// 用 portFree 而不是 ownInstance 轮询：后者每次要发一次 HTTP、超时 1.5 秒，
+// 这个循环会慢得没法用。
+func waitInstanceGone(d time.Duration) bool {
+	deadline := time.Now().Add(d)
+	for time.Now().Before(deadline) {
+		if portFree(appPort) {
+			// 连查两次，避免对方的监听套接字还没彻底关闭就抢着 bind。
+			time.Sleep(120 * time.Millisecond)
+			if portFree(appPort) {
+				return true
+			}
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	return false
 }
 
 // ── 启动 ────────────────────────────────────────────────────────────
@@ -526,12 +547,18 @@ func main() {
 	if ownInstance() {
 		logf("已有实例运行在 %s，唤出既有窗口", baseURL())
 		if !focusExisting() {
-			// 对方没响应、或它自己手上也没有窗口。这里不再补开：本进程马上就要
-			// 退出，新开的窗口没人接管，会变成关不掉的孤儿。老实例检测到浏览器
-			// 进程已死会自行退出，用户再点一次图标即可。
-			logf("既有实例未返回窗口，等待其自行退出")
+			// 对方没有窗口——多半是用户刚把窗口关掉，它还在等心跳过期（最多
+			// 二十秒）才收摊。这时候直接退出，用户会觉得「点了没反应」。它会
+			// 收到唤出请求后主动退出，这里等它让出端口就接着启动。等不到说明
+			// 对方其实活得好好的，那就安静退出，绝不抢跑。
+			if !waitInstanceGone(30 * time.Second) {
+				logf("既有实例未返回窗口、也没退出，放弃启动")
+				return
+			}
+			logf("既有实例已退出，由本进程继续启动")
+		} else {
+			return
 		}
-		return
 	}
 	if !portFree(appPort) {
 		logf("端口 %s 被占用", appPort)
@@ -591,7 +618,7 @@ func main() {
 			// 不能只靠心跳：页面若因代理/证书/网络策略加载失败，脚本根本不执行，
 			// 心跳永远不来，程序会在 150 秒后自行消失（用户只会看到"点了没反应"）。
 			if browser != nil && browser.Process != nil {
-				if !pidAlive(browser.Process.Pid) {
+				if browserWindowGone() {
 					logf("窗口已关闭，退出")
 					shutdown()
 				}
@@ -620,4 +647,72 @@ func pidAlive(pid int) bool {
 		return false
 	}
 	return code == stillActive
+}
+
+// ── 窗口存活判定 ──────────────────────────────────────────────────────
+//
+// 这一段修的是「第一次启动闪退、第二次才行」。原来的判据只有一个：
+// pidAlive(browser.Process.Pid) 为 false 就认定窗口关了，随即 shutdown()
+// 把整棵进程树杀掉。但 Edge 首次初始化一个全新的 user-data-dir 时会把自己
+// relaunch 一次（旧主进程退出、新进程接管窗口），那个 pid 必然变成「已退出」
+// —— 管家于是亲手关掉了还好好开着的窗口。现场证据：失败那几次的 profile
+// 目录里留着 first_party_sets.db-journal / DIPS-wal，且没有正常退出才会写的
+// Local State，说明进程是被强杀的，不是自己退的；再点一次就好，因为那时
+// profile 已初始化完，不再 relaunch。
+//
+// 现在三重判据，任意一条说明窗口还在就不退出：
+//  1. 当初拉起的主进程还活着；
+//  2. 主进程没了，但 Job 里还有别的进程（relaunch 出来的新主进程/渲染进程）；
+//  3. 以上都不成立，但页面最近还在发心跳 —— JS 在跑，窗口就是活的。
+// 宁可晚退几秒，也不能误杀。
+
+const (
+	// 刚拉起的这十秒里 Edge 可能还在初始化、自我重启，不做死亡判定。
+	browserGrace = 10 * time.Second
+	// 页面心跳保鲜期：ui.html 每 3 秒 POST 一次 /accounts/api/ping。
+	browserHeartbeatFresh = 20 * time.Second
+)
+
+// jobLiveness 是「Job 里的进程数能否说明窗口还在」的判定核心，独立出来便于测试。
+func jobLiveness(active int, known bool) bool {
+	// 只剩一个成员时主进程已经退了（可能只剩 crashpad-handler 收尾），不算活；
+	// 两个以上（新主进程 + 渲染 + GPU…）才说明窗口有人接管。
+	return known && active > 1
+}
+
+// browserAlive 判断我们拉起的浏览器是否还在跑。
+func browserAlive() bool {
+	if browser != nil && browser.Process != nil && pidAlive(browser.Process.Pid) {
+		return true
+	}
+	n, known := jobActiveCount()
+	return jobLiveness(n, known)
+}
+
+// browserWindowGone 判断窗口是不是真的没了。只有它返回 true 才该退出。
+func browserWindowGone() bool {
+	if time.Since(winBootAt) < browserGrace {
+		return false
+	}
+	// 连查 3 次、间隔 400ms：单次查询的瞬时失败不能当成窗口关闭。
+	// 用户真关窗时多花这 0.8 秒，完全无感。
+	for i := 0; i < 3; i++ {
+		if i > 0 {
+			time.Sleep(400 * time.Millisecond)
+		}
+		if browserAlive() {
+			return false
+		}
+	}
+	// 最后一道保险：页面还在发心跳，说明 JS 在跑、窗口没关。
+	if age := time.Since(time.Unix(0, lastSeen.Load())); age < browserHeartbeatFresh {
+		if !winBeatLogged {
+			winBeatLogged = true
+			logf("窗口主进程已退出，但页面 %v 前仍有心跳，判定窗口仍在（Edge 自我重启）",
+				age.Round(time.Second))
+		}
+		return false
+	}
+	winBeatLogged = false
+	return true
 }

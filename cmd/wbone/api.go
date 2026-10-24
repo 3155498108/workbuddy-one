@@ -235,8 +235,23 @@ func registerAccounts(mux *http.ServeMux) {
 		lastSeen.Store(time.Now().UnixNano())
 		// 切号后 WorkBuddy 客户端会重新启动并抢到前台，管家窗口被压在后面。
 		// 用户以为管家没了就会再点一次图标——那正是产生孤儿窗口的源头。
-		h := ensureVisibleSelf(4)
+		// 浏览器进程已经没了就不用再花两秒等窗口出现——直接让位，快一点。
+		h := uintptr(0)
+		if browserAlive() {
+			h = ensureVisibleSelf(4)
+		}
 		writeJSON(w, map[string]any{"ok": true, "found": h != 0})
+		// 手上已经没有窗口了（用户刚关掉窗口，本进程还在等心跳过期才收摊）。
+		// 与其让新进程干等二十秒，不如现在就退出让位，用户点一次就能起来。
+		// 复查一遍浏览器进程：窗口标题暂时匹配不上时（Edge 自我重启的瞬间）
+		// 不能误判成「窗口没了」，那会平白杀掉一个好好的窗口。
+		if h == 0 && !browserAlive() {
+			go func() {
+				time.Sleep(300 * time.Millisecond)
+				logf("被唤出时确认窗口已不在，退出让位")
+				shutdown()
+			}()
+		}
 	})
 	mux.HandleFunc("POST /accounts/api/quit", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, map[string]any{"ok": true})

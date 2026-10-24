@@ -1140,9 +1140,7 @@ func beginApply(latest string) error {
 			return
 		}
 		logf("已更新到 v%s，新版本已拉起，关闭旧窗口", latest)
-		if browser != nil && browser.Process != nil {
-			_ = browser.Process.Kill()
-		}
+		killBrowser()
 		// 等窗口退出回调打完日志再走；端口随本进程退出释放，新进程在 handoffWait 里等它。
 		time.Sleep(400 * time.Millisecond)
 		os.Exit(0)
