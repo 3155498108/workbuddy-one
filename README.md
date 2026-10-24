@@ -15,7 +15,7 @@
 
 不想装 Go 自己编译的，直接拿现成的：
 
-**[Releases](https://github.com/3155498108/workbuddy-one/releases)** → `WorkBuddyOne-v1.0.8-win64.zip`（约 4.1 MB）
+**[Releases](https://github.com/3155498108/workbuddy-one/releases)** → `WorkBuddyOne-v1.0.9-win64.zip`（约 4.1 MB）
 
 解压后双击 `WorkBuddyOne.exe` 就能用，**不需要装 Go、Node 或任何运行时**——界面是调用系统自带的
 Edge（或 Chrome）以 `--app` 模式显示，Windows 10/11 上本来就有。首次运行会在同目录自动生成
@@ -94,10 +94,34 @@ AES-GCM 信封（`$wbEncrypted`）。所以做法很简单：**整份文件搬�
 - 保存：把当前 `.info` 复制到 `profiles/<uid>/`
 - 切换：先备份当前登录态 → 覆盖目标账号的快照 → 重启客户端
 - 只处理国内版（`workbuddy-desktop`），国际版线路不碰
-- 客户端会轮换 refresh token，所以每次切换前都会把当前账号重新存一遍，避免旧快照失效
+- **快照会自动跟着客户端续期**（1.0.9 起）：客户端每次续期都会换一份新的
+  refresh token 并把旧的作废，而它只写活动的 `.info`。所以管家每 3 分钟
+  （切号后 8 秒、40 秒各补一次）把活动登录态同步进快照，保证快照里永远是最新那份。
 
 > 注意：面板 `auths/*.json` 里的明文 token **无法**用来伪造客户端登录态。
 > 只有真的在客户端里登录过的账号，才能被保存和切换。
+
+#### 登录态能保存多久
+
+`.info` 里有三个明文时间戳，寿命是能直接算出来的：
+
+| 字段 | 含义 |
+|---|---|
+| `expiresAt` | access token 到期（实测约 28 天） |
+| `refreshExpiresAt` | refresh token 到期，**每成功续期一次就重置为「当时 + 30 天」** |
+| `lastRefreshTime` | 上次续期的时刻 |
+
+规则很简单：**30 天内在客户端里打开过这个账号一次，它就一直是活的**；
+超过 30 天没动过，就必须重新登录。界面上每个账号会直接显示「登录态还剩 N 天」，
+剩 7 天变黄、过期变红，鼠标悬停能看到具体到期时刻和上次续期时间。
+
+两个容易踩的点：
+
+- **没过期也可能要重新登录**。客户端每次续期都会换一份新 refresh token，旧的随即
+  作废。如果快照里存的是已经被换掉的那份，切过去照样会被要求登录——这不是时间到了，
+  是 token 被替换了。1.0.9 起自动同步快照就是为了堵这个洞。
+- **别在客户端里手动切号**。手动切会直接覆盖 `.info`，被切走的那个账号的 token
+  就永久丢了（管家没机会保存）。换号请用本程序。
 
 ### 2. 统一界面
 
@@ -217,7 +241,7 @@ go-winres simply --arch amd64 --out wbone --manifest gui \
   --icon app.ico \
   --product-name "WorkBuddy 管家" \
   --file-description "WorkBuddy 客户端账号切换 + API 面板" \
-  --file-version 1.0.8 --product-version 1.0.8 \
+  --file-version 1.0.9 --product-version 1.0.9 \
   --original-filename WorkBuddyOne.exe \
   --copyright "MIT License"
 mv wbone_windows_amd64.syso rsrc.syso

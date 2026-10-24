@@ -221,6 +221,81 @@ func readMeta(uid string) meta {
 	return m
 }
 
+// snapshotCred 登录态文件里**明文可读**的几个时间戳（token 本身是客户端 AES 信封，
+// 我们解不开，也不需要解开——只看时间）。
+//
+// 关键字段是 refreshExpiresAt：客户端的 refresh token 是「30 天滚动」的，
+// 每成功续期一次就重置为「当时 + 30 天」。所以它能回答用户最关心的问题——
+// 这个账号还有多久会要求重新登录。
+type snapshotCred struct {
+	AccessExpiresAt  int64 `json:"-"`
+	RefreshExpiresAt int64 `json:"-"`
+	LastRefreshAt    int64 `json:"-"`
+}
+
+// credOfPath 读一份 .info 的明文时间戳。文件可能是客户端没登录的空壳，读不到就返回零值。
+func credOfPath(path string) snapshotCred {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return snapshotCred{}
+	}
+	var doc struct {
+		Auth struct {
+			ExpiresAt        int64 `json:"expiresAt"`
+			RefreshExpiresAt int64 `json:"refreshExpiresAt"`
+			LastRefreshTime  int64 `json:"lastRefreshTime"`
+		} `json:"auth"`
+	}
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		return snapshotCred{}
+	}
+	return snapshotCred{
+		AccessExpiresAt:  doc.Auth.ExpiresAt,
+		RefreshExpiresAt: doc.Auth.RefreshExpiresAt,
+		LastRefreshAt:    doc.Auth.LastRefreshTime,
+	}
+}
+
+// msToSec 客户端写的是毫秒，统一换成秒给前端。0 保持 0（= 未知）。
+func msToSec(ms int64) int64 {
+	if ms <= 0 {
+		return 0
+	}
+	return ms / 1000
+}
+
+// syncActiveSnapshots 把当前活动登录态同步进对应账号的快照，返回更新了几份。
+//
+// 为什么必须做这件事：客户端每次刷新 token 都会换一份新的 refresh token（旧的那份
+// 随即作废），但它只把新的写进「活动」的 <product>.info，不会写我们的快照。
+// 于是快照里的 token 会越来越旧，等切回该账号时客户端拿旧 token 去续期，
+// 上游直接拒绝——用户看到的就是「切过去要求重新登录」。
+//
+// 判断依据用 refreshExpiresAt：只有活动文件比快照「更新」（到期时间更晚）才覆盖，
+// 避免把一份已经失效的登录态覆盖到还有效的快照上。
+func syncActiveSnapshots() int {
+	n := 0
+	for _, f := range scanProducts() {
+		dst := snapPath(f.UID, f.Product)
+		live := credOfPath(f.Path)
+		if live.RefreshExpiresAt <= 0 {
+			continue // 活动文件没有有效凭证，别污染快照
+		}
+		old := credOfPath(dst)
+		if old.RefreshExpiresAt >= live.RefreshExpiresAt {
+			continue // 快照已经一样新或更新
+		}
+		if err := os.MkdirAll(profileDir(f.UID), 0o755); err != nil {
+			continue
+		}
+		if err := copyFileAtomic(f.Path, dst); err != nil {
+			continue
+		}
+		n++
+	}
+	return n
+}
+
 // snapshotsOf 返回该账号保存过快照的产品线集合。
 func snapshotsOf(uid string) []string {
 	entries, err := os.ReadDir(profileDir(uid))
@@ -260,6 +335,7 @@ func accounts() []accountResp {
 		if len(prods) == 0 {
 			continue
 		}
+		var minExp int64
 		m := readMeta(uid)
 		if m.Nickname == "" {
 			m.Nickname = "账号 " + shortUID(uid)
@@ -281,7 +357,17 @@ func accounts() []accountResp {
 			} else {
 				item.Lines = append(item.Lines, "国内版")
 			}
+			// 取所有线路里最早到期的那个作为整个账号的到期时间：
+			// 只要有一条线路快过期，这个号就快需要重新登录了。
+			c := credOfPath(snapPath(uid, p))
+			if c.RefreshExpiresAt > 0 && (minExp == 0 || c.RefreshExpiresAt < minExp) {
+				minExp = c.RefreshExpiresAt
+			}
+			if sec := msToSec(c.LastRefreshAt); sec > item.LastRefreshAt {
+				item.LastRefreshAt = sec
+			}
 		}
+		item.ExpiresAt = msToSec(minExp)
 		if _, ok := live[uid]; ok {
 			item.Active = true
 			if item.UIN == "" {
@@ -405,4 +491,95 @@ func shortUID(uid string) string {
 		return uid[:8]
 	}
 	return uid
+}
+
+// ── 登录态寿命 ──────────────────────────────────────────────────────
+
+// credOfAccount 汇总该账号所有线路里「最早到期」和「最近一次续期」的时间戳（毫秒）。
+func credOfAccount(uid string) (lastRefresh, expires int64) {
+	for _, p := range snapshotsOf(uid) {
+		c := credOfPath(snapPath(uid, p))
+		if c.LastRefreshAt > lastRefresh {
+			lastRefresh = c.LastRefreshAt
+		}
+		if c.RefreshExpiresAt > 0 && (expires == 0 || c.RefreshExpiresAt < expires) {
+			expires = c.RefreshExpiresAt
+		}
+	}
+	return lastRefresh, expires
+}
+
+// credNote 给切换结果加一句登录态寿命说明。
+//
+// 为什么要在切号时就说：客户端每次续期都会换新 refresh token 并把旧的作废，
+// 而快照只能记住「上次在客户端里跑过时」那一份。所以一个放了几天没动的账号，
+// 切过去很可能直接被要求重新登录——这不是时间到了，是旧 token 被换掉了。
+// 提前把天数说出来，用户就不会觉得「明明没过期怎么又要登录」。
+func credNote(uid string) string {
+	last, exp := credOfAccount(uid)
+	if last <= 0 {
+		return ""
+	}
+	idleDays := int(time.Since(time.UnixMilli(last)).Hours() / 24)
+	if idleDays < 1 {
+		return "" // 刚续过期，没什么好提醒的
+	}
+	note := fmt.Sprintf("（该账号上次续期是 %d 天前", idleDays)
+	if exp > 0 {
+		d := time.Until(time.UnixMilli(exp))
+		switch {
+		case d <= 0:
+			note += "，登录态已过期"
+		case d < 24*time.Hour:
+			// 不能写成「还剩 0 天」：整数除法把不足一天截成 0，读起来像没过期。
+			note += "，登录态不到 1 天了"
+		default:
+			note += fmt.Sprintf("，登录态还剩 %d 天", int(d.Hours()/24))
+		}
+	}
+	note += "；万一被要求重新登录，登一次就会重新计时）"
+	return note
+}
+
+// credWarnShort 报告该账号是否「快要（或已经）需要重新登录」。
+// 界面拿它给卡片标黄/标红，阈值取 7 天：客户端续期窗口是 30 天，
+// 7 天足够用户挑个时间切过去跑一次。
+func credWarnShort(uid string) (days int, known bool) {
+	_, exp := credOfAccount(uid)
+	if exp <= 0 {
+		return 0, false
+	}
+	return int(time.Until(time.UnixMilli(exp)).Hours() / 24), true
+}
+
+// syncSnapshotsSoon 在客户端刚启动并刷完 token 之后，把活动登录态同步进快照。
+//
+// 时序很重要：切号是「覆盖 .info → 启动客户端」，客户端启动后才用它自己的
+// 流程续期，续期成功会把**新的** refresh token 写回活动 .info。那一刻我们的
+// 快照就落后了——如果用户下次切回来之前没再切走（切走时会 saveCurrent），
+// 就会拿到旧 token。所以这里在启动后补两次同步。
+func syncSnapshotsSoon() {
+	for _, d := range []time.Duration{8 * time.Second, 40 * time.Second} {
+		time.Sleep(d)
+		if n := syncActiveSnapshots(); n > 0 {
+			logf("已同步 %d 份账号快照（客户端续期后的最新登录态）", n)
+		}
+	}
+}
+
+// refreshSnapshotLoop 管家运行期间持续跟踪登录态。
+//
+// 3 分钟一次，每次只读几个几 KB 的 JSON——客户端不会更勤地续期
+// （access token 有效期是 28 天，它重启才刷），所以没必要更频繁。
+func refreshSnapshotLoop() {
+	if n := syncActiveSnapshots(); n > 0 {
+		logf("已同步 %d 份账号快照", n)
+	}
+	t := time.NewTicker(3 * time.Minute)
+	defer t.Stop()
+	for range t.C {
+		if n := syncActiveSnapshots(); n > 0 {
+			logf("已同步 %d 份账号快照（登录态已续期）", n)
+		}
+	}
 }

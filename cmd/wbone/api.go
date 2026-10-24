@@ -16,6 +16,15 @@ type accountResp struct {
 	SavedAt  string   `json:"saved_at,omitempty"`
 	Lines    []string `json:"lines"`
 	Active   bool     `json:"active"`
+
+	// ExpiresAt 该账号 refresh token 的硬到期时间（Unix 秒，0 = 不知道）。
+	// 客户端的 refresh token 是 30 天滚动：每成功续期一次就重置为「当时 + 30 天」。
+	// 超过这个时间必须重新登录——但注意**没到期也可能要重登**，见下。
+	ExpiresAt int64 `json:"expires_at,omitempty"`
+	// LastRefreshAt 该账号最后一次成功续期的时间（Unix 秒）。这才是真正的倒计时起点：
+	// 客户端每次刷新都会换一份新 refresh token 并把旧的作废，而它只写活动文件，
+	// 所以「多久没在客户端里跑过」比「到期时间」更能预示会不会掉登录。
+	LastRefreshAt int64 `json:"last_refresh_at,omitempty"`
 }
 
 type stateResp struct {
@@ -95,13 +104,17 @@ func doSwitch(uid string, restart bool) (string, error) {
 	// 客户端此时已退出，正好改数据库：把本地历史全部归到新账号名下，
 	// 切过去侧栏就能看到之前所有对话（开关关闭时这里什么都不做）。
 	syncAfterSwitch(uid)
+	note := credNote(uid)
 	if restart || wasRunning {
 		if err := restartClient(); err != nil {
 			return "已切换，但自动启动客户端失败，请手动打开 WorkBuddy", nil
 		}
-		return "已切换，WorkBuddy 正在重新启动", nil
+		// 客户端启动后会自己续期并写回新的 refresh token，那时再同步一次快照，
+		// 否则快照里留的是切走时那份旧的，下次切回来又要登录。
+		go syncSnapshotsSoon()
+		return "已切换，WorkBuddy 正在重新启动" + note, nil
 	}
-	return "已切换，下次启动 WorkBuddy 即为新账号", nil
+	return "已切换，下次启动 WorkBuddy 即为新账号" + note, nil
 }
 
 // registerAccounts 把账号页的接口注册到网关的同一套路由上。

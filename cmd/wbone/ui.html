@@ -138,6 +138,8 @@
   .tag.cur{background:#e6f8ee;color:#0b8a45;border-color:#c6eed7}
   .tag.line{background:#f3f5f8;color:#4b5563;border-color:#e6e8ec}
   .tag.credit{background:#f6f2ff;color:#6b46c1;border-color:#e6dcfb}
+  .tag.warn{background:#fff7e6;color:#a16207;border-color:#fde8b8}
+  .tag.bad{background:#fdecec;color:#b91c1c;border-color:#f8cfcf}
   .edit{
     border:none;background:transparent;color:#b8bec9;font-size:12px;cursor:pointer;padding:1px 3px;
     border-radius:4px;line-height:1;font-family:inherit;
@@ -427,16 +429,37 @@ function render() {
     const stateTag = pa && pa.disabled ? `<span class="tag line">面板已禁用</span>`
       : (pa && pa.cooling ? `<span class="tag line">面板冷却中</span>` : "");
 
+    // 登录态剩余寿命。客户端 refresh token 是 30 天滚动：每在客户端里跑一次
+    // 就续 30 天；超过 30 天没动过，就必须重新登录。
+    let credTag = "";
+    if (a.expires_at) {
+      const leftMs = a.expires_at * 1000 - Date.now();
+      const left = Math.floor(leftMs / 86400000);
+      const tip = `refresh token 到期：${fmtDate(new Date(a.expires_at * 1000).toISOString())}` +
+        (a.last_refresh_at ? `\n上次续期：${fmtDate(new Date(a.last_refresh_at * 1000).toISOString())}` : "") +
+        "\n\n这个号只要切过去把 WorkBuddy 打开一次，就会重新续 30 天。";
+      const cls = leftMs <= 0 ? "bad" : (left <= 7 ? "warn" : "");
+      const text = leftMs <= 0 ? "登录态已过期" : (left < 1 ? "登录态不足 1 天" : `登录态还剩 ${left} 天`);
+      credTag = `<span class="tag ${cls}" title="${escapeHtml(tip)}">${text}</span>`;
+    }
+
+    // 「多久没在客户端里跑过」比到期时间更能预示会不会掉登录：
+    // 客户端每次续期都会换掉旧的 refresh token。
+    const idleDays = a.last_refresh_at
+      ? Math.floor((Date.now() - a.last_refresh_at * 1000) / 86400000) : -1;
+    const idleTxt = idleDays < 0 ? ""
+      : (idleDays === 0 ? " · 今天续期" : ` · ${idleDays} 天前续期`);
+
     card.innerHTML = `
       <div class="avatar">${initials(a.nickname)}</div>
       <div class="meta">
         <div class="name">
           ${escapeHtml(a.nickname)}
           ${a.active ? '<span class="tag cur">当前使用</span>' : ""}
-          ${tags}${creditTag}${stateTag}
+          ${tags}${creditTag}${stateTag}${credTag}
           <button class="edit" title="重命名">改名</button>
         </div>
-        <div class="id">UID ${escapeHtml(a.uid)}${a.saved_at ? " · 保存于 " + fmtDate(a.saved_at) : ""}</div>
+        <div class="id">UID ${escapeHtml(a.uid)}${a.saved_at ? " · 保存于 " + fmtDate(a.saved_at) : ""}${idleTxt}</div>
       </div>
       <button class="act ${a.active ? "" : "primary"}" ${a.active ? "disabled" : ""}>${a.active ? "正在使用" : "切换到此账号"}</button>`;
 

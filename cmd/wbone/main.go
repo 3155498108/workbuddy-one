@@ -33,7 +33,7 @@ import (
 
 const (
 	appTitle   = "WorkBuddy 管家"
-	appVersion = "1.0.8"
+	appVersion = "1.0.9"
 )
 
 var browserCandidates = []string{
@@ -572,6 +572,11 @@ func main() {
 		time.Sleep(6 * time.Second)
 		autoCheckOnce()
 	}()
+
+	// 登录态保活：客户端每次续期都会换一份新的 refresh token 并作废旧的，
+	// 但它只写活动的 .info，不写我们的 profiles/ 快照。切号时快照里若是旧的，
+	// 切过去就会被要求重新登录。所以这里持续把活动登录态同步进快照。
+	go refreshSnapshotLoop()
 
 	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
