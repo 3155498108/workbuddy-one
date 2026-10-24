@@ -15,7 +15,7 @@
 
 不想装 Go 自己编译的，直接拿现成的：
 
-**[Releases](https://github.com/3155498108/workbuddy-one/releases)** → `WorkBuddyOne-v1.0.7-win64.zip`（约 4.1 MB）
+**[Releases](https://github.com/3155498108/workbuddy-one/releases)** → `WorkBuddyOne-v1.0.8-win64.zip`（约 4.1 MB）
 
 解压后双击 `WorkBuddyOne.exe` 就能用，**不需要装 Go、Node 或任何运行时**——界面是调用系统自带的
 Edge（或 Chrome）以 `--app` 模式显示，Windows 10/11 上本来就有。首次运行会在同目录自动生成
@@ -125,12 +125,19 @@ WorkBuddy 的对话按账号隔离：`~/.workbuddy/workbuddy.db` 的 `sessions` 
 - **没有「要不要自动装」的开关**。1.0.6 之前有，默认还是关的；结果是大部分人
   永远不勾，于是永远停在老版本上，而老版本的更新本身又是坏的——死循环。
   现在固定全自动，只保留「点一下立即检查」的手动入口。
-- **查版本不走 API**。匿名调用 `api.github.com` 是**按 IP 每小时 60 次**，
-  很容易 403 `rate limit exceeded`（用户实际撞过）。默认路径改成读
+- **查版本不走 API，而且并发问多个源**。匿名调用 `api.github.com` 是**按 IP
+  每小时 60 次**，很容易 403 `rate limit exceeded`（用户实际撞过）。默认路径改成读
   `github.com/<repo>/releases/latest` 的 302 `Location` 拿 tag，再按固定命名
   拼出下载地址——全程不碰 API，没有配额问题。代理把 302 拆成 200 时，
-  还会从页面正文里再找一次。API 只在自定义 `update_feed` 或零配额路径失手时兜底，
-  可选配 `update_token` 提高额度。
+  还会从页面正文里再找一次。**直连和几个加速源是并发问的**（串行试五个源要等
+  一分多钟），拿到多个结果时取版本号最大的那个——公共反代会缓存旧页面，
+  先到的未必最新。API 只在自定义 `update_feed` 或全部源失手时兜底。
+- **下载能自动换源，这是国内能用的关键**。GitHub 的资产走
+  `objects.githubusercontent.com`，国内常常「连接建立后一直不回」。
+  候选顺序是「上次成功的源 → 直连 → 加速源」，一个源 12 秒拿不到响应头或
+  一个字节都没下到就换下一个；换源时删掉残包重下（不同源的 `Range` 语义不一样，
+  拼起来 CRC 必然对不上）。成功后把那个源记进 `update_mirror`，以后直接用，
+  不用每次都在直连上白等一轮。
 - **下载按「有没有进展」判定失败，不设总时长**。`http.Client.Timeout` 计的是整个
   请求（含读完 body），慢速下载会被它从中间掐断——v1.0.3~v1.0.5 更新失败报的
   `context deadline exceeded ... while reading body` 全是这个。现在只有「连续 25 秒
@@ -140,16 +147,27 @@ WorkBuddy 的对话按账号隔离：`~/.workbuddy/workbuddy.db` 的 `sessions` 
   都认、大小写不敏感，包里只有一个 exe 时还会兜底采用。
 - **装的是 zip 不是裸 exe**。zip 每条记录都有 CRC，解压时能发现下载被截断或被
   中间页顶掉；裸 exe 拿不到任何完整性信息。取出后还会校验 PE 文件头。
-- **换文件靠改名，不靠覆盖**。Windows 上正在运行的 exe 允许改名、不允许覆盖，
-  所以顺序是「旧的改名 `.old` → 新的改名到位」，任何一步失败都回滚，
-  你手上始终有一个能启动的 exe。
+- **换文件靠改名，不靠覆盖；备份名一定带唯一后缀**。Windows 上正在运行的 exe
+  允许改名、不允许覆盖，所以顺序是「旧的改名 → 新的改名到位」，任何一步失败都回滚，
+  你手上始终有一个能启动的 exe。备份名以前固定是 `.old`，踩过一个很隐蔽的坑：
+  上一次把「正在运行的 exe」改名成 `.old` 再删除之后，那个名字会停在
+  **delete-pending**（进程映像还被引用）——目录里看不见它，但它既不能被创建，
+  也不能当 `MOVEFILE_REPLACE_EXISTING` 的目标，于是下一次 rename 直接
+  `Access is denied`。现在用 `<exe>.old-<pid>-<序号>`，启动时通配清掉旧备份。
+- **替换失败绝不关窗口**。以前是「先关窗口再换文件」，换文件一失败就成了
+  「窗口没了、进程被窗口退出回调带走、新版本根本没起来」——用户看到的就是
+  「更新完就再也不启动了」。现在只有新进程真的拉起来了才关窗口；失败时原样
+  留着窗口，界面上直接显示原因（侧栏那一行变红，鼠标悬停看全文，`data/app.log`
+  里也有）。
 - **新进程会等端口**。旧进程退出的最后几百毫秒里端口还占着，新版本如果直接起
   会因「端口被占用」自杀——那才是真的「更新完打不开了」。接棒启动时会先等端口释放。
 
-更新源默认是 GitHub Release 的 `latest`，连不上（比如没代理）会明确报错、不影响正常使用。
-要换镜像可以设环境变量 `WBONE_UPDATE_FEED` 或在 `data/prefs.json` 里写 `update_feed`
-（格式同 GitHub `releases/latest` 的响应）。撞上 API 限流时可加 `update_token`
-（GitHub token）提高额度——默认路径用不到它。
+更新源默认是 GitHub Release 的 `latest`。加速源列表在 `cmd/wbone/update.go` 的
+`updateMirrors` 里（按实测速度排序：gh-proxy.com → ghfast.top → ghproxy.net），
+自建源可以用环境变量 `WBONE_UPDATE_MIRROR` 或 `data/prefs.json` 的 `update_mirror`
+指定，它会被排到第一位。换整个更新源（比如自己的 OSS）仍然设 `WBONE_UPDATE_FEED`
+或 `update_feed`（格式同 GitHub `releases/latest` 的响应）。撞上 API 限流时可加
+`update_token`（GitHub token）提高额度——默认路径用不到它。
 
 ### 5. 任务中心：新任务自动跟上
 
@@ -199,7 +217,7 @@ go-winres simply --arch amd64 --out wbone --manifest gui \
   --icon app.ico \
   --product-name "WorkBuddy 管家" \
   --file-description "WorkBuddy 客户端账号切换 + API 面板" \
-  --file-version 1.0.7 --product-version 1.0.7 \
+  --file-version 1.0.8 --product-version 1.0.8 \
   --original-filename WorkBuddyOne.exe \
   --copyright "MIT License"
 mv wbone_windows_amd64.syso rsrc.syso

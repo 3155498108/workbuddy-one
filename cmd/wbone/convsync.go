@@ -297,6 +297,7 @@ type prefs struct {
 	LastUpdateCheck int64  `json:"last_update_check,omitempty"` // unix 秒
 	UpdateFeed      string `json:"update_feed,omitempty"`       // 自定义更新源（GitHub API 形状）
 	UpdateToken     string `json:"update_token,omitempty"`      // GitHub token，仅用于提高 API 额度
+	UpdateMirror    string `json:"update_mirror,omitempty"`     // 上次下载成功的加速前缀，下次优先用它
 }
 
 func prefsPath() string { return filepath.Join(baseDir(), "data", "prefs.json") }

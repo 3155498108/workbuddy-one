@@ -57,6 +57,8 @@
   .upd.hot{background:var(--accent-soft);color:#1d4ed8}
   .upd.hot span{font-weight:650}
   .upd.hot button{background:var(--accent);border-color:var(--accent);color:#fff}
+  .upd.err{background:#fef2f2;color:#b91c1c}
+  .upd.err button{background:#fff;border-color:#f3c6c6;color:#b91c1c}
   body.compact .upd{display:none}
 
   /* 面板视图：侧栏收成图标条，把宽度让给 iframe（两层侧栏并排太挤） */
@@ -489,6 +491,10 @@ function renderUpdate() {
   const pct = (has && upd.applying && upd.asset_size > 0)
     ? Math.max(0, Math.min(100, Math.round((upd.got_bytes || 0) / upd.asset_size * 100)))
     : -1;
+  // 更新失败必须能看见。以前这个 error 字段只在检查失败时弹个 toast，
+  // 替换失败（目录只读、被杀软锁住）时界面上什么都不显示——用户还以为
+  // 它在重启，其实是原地失败了。
+  const errMsg = (!has && upd && upd.error) ? String(upd.error) : "";
   if (has) {
     txt.textContent = pct >= 0
       ? `v${cur} → v${upd.latest} · 下载 ${pct}%`
@@ -497,14 +503,18 @@ function renderUpdate() {
   } else if (upd && upd.applying) {
     txt.textContent = `正在更新到 v${upd.latest}`;
     btn.textContent = "更新中…";
+  } else if (errMsg) {
+    txt.textContent = "更新出错：" + (errMsg.length > 34 ? errMsg.slice(0, 34) + "…" : errMsg);
+    btn.textContent = "重试";
   } else {
     txt.textContent = upd && upd.checked_at
       ? `v${cur} · ${upd.checked_at.slice(5)} 已检查`
       : `v${cur}`;
     btn.textContent = btn.disabled ? "检查中…" : "检查更新";
   }
+  box.classList.toggle("err", !!errMsg);
   // 更新全自动：查到就装、装完自己重启，没有开关可点。
-  box.title = has ? `发现新版本 v${upd.latest}，正在自动安装` : "检查是否有新版本";
+  box.title = errMsg || (has ? `发现新版本 v${upd.latest}，正在自动安装` : "检查是否有新版本");
 }
 
 $("#btnUpd").onclick = async () => {
@@ -535,13 +545,33 @@ $("#btnUpd").onclick = async () => {
     try {
       const d = await api("/accounts/api/update/apply", {});
       clearInterval(tick);
-      toast(d.message || "正在更新，管家即将重启");
-      setTimeout(() => {
-        document.body.innerHTML =
-          `<div style="display:grid;place-items:center;height:100vh;color:#6b7280;font-size:13.5px;line-height:1.9;text-align:center">
-             <div>正在更新到 v${upd.latest}，管家会自动重启<br><small style="color:#9aa1ad">稍等几秒，窗口会重新打开</small></div>
-           </div>`;
-      }, 700);
+      toast(d.message || "正在替换程序，稍候");
+      // 这里**不能**立刻把整页换成「正在重启」：apply 返回只代表安装包下完、
+      // 替换已排队，真正换 exe 在后台。万一替换失败（目录只读、被杀软锁住），
+      // 进程不会退出、窗口也不会重开，用户就对着一个假的「稍等几秒」干等——
+      // 这就是「更新完它关掉就不启动了」的观感来源。
+      // 用可移除的遮罩 + 继续轮询错误，失败就把界面还回去并说明原因。
+      const mask = document.createElement("div");
+      mask.style.cssText = "position:fixed;inset:0;z-index:9999;display:grid;place-items:center;" +
+        "background:#fff;color:#6b7280;font-size:13.5px;line-height:1.9;text-align:center";
+      mask.innerHTML = `<div>正在替换程序并重启<br><small style="color:#9aa1ad">窗口会关闭一次，几秒后重新出现</small></div>`;
+      document.body.appendChild(mask);
+      const watch = setInterval(async () => {
+        try {
+          const r = await fetch("/accounts/api/update", { cache: "no-store" });
+          if (!r.ok) return;
+          const s = await r.json();
+          if (s.error && !s.applying) {
+            clearInterval(watch);
+            upd = s;
+            mask.remove();
+            btn.disabled = false;
+            renderUpdate();
+            toast("更新失败：" + s.error, true);
+          }
+        } catch (e) { /* 进程已经退了，轮询不到是正常的 */ }
+      }, 800);
+      setTimeout(() => clearInterval(watch), 30000); // 兜底：30 秒后停止轮询
     } catch (e) {
       clearInterval(tick);
       toast("更新失败：" + e.message, true);

@@ -48,7 +48,10 @@ const (
 	updateHandoffEnv  = "WBONE_UPDATE_HANDOFF"
 
 	// updateHeaderTimeout 下载请求等响应头的上限（连不上/被拦要快速失败，别干等）。
-	updateHeaderTimeout = 20 * time.Second
+	// 12 秒是权衡：国内直连 GitHub 失败时多半是「TCP 连上了但一直没响应」，
+	// 等 20 秒太久，用户看着「下载 0%」会以为卡死；而真正能下通的源，
+	// 首字节基本都在 3 秒内到。
+	updateHeaderTimeout = 12 * time.Second
 )
 
 // 下面几个做成 var 而不是 const，是为了让测试能把「25 秒」压成毫秒级
@@ -118,6 +121,75 @@ const (
 	updateLatestPage = "https://github.com/" + updateRepo + "/releases/latest"
 )
 
+// updateMirrors 公共加速前缀。国内直连 github.com 常常连得上、但一跳到
+// objects.githubusercontent.com 就卡死或只有几十 KB/s，所以直连失败（或太慢）
+// 时必须能换路。这些反代用法统一是「前缀 + 完整原始地址」。
+//
+// 顺序按实测速度排（2026-10 测 v1.0.7 包，取首 1 MiB）：
+// gh-proxy.com 666 KB/s、ghfast.top 416 KB/s、ghproxy.net 92 KB/s。
+// github.moeyy.xyz 已失效（连接直接被拒），不要加回来。
+// 不放心的源可以删掉，也可以用 prefs 的 update_mirror 或环境变量
+// WBONE_UPDATE_MIRROR 指定自建源。
+var updateMirrors = []string{
+	"https://gh-proxy.com",
+	"https://ghfast.top",
+	"https://ghproxy.net",
+}
+
+// mirrorURL 把原始 GitHub 地址套到加速前缀上。空前缀 = 直连，原样返回。
+func mirrorURL(prefix, raw string) string {
+	prefix = strings.TrimRight(strings.TrimSpace(prefix), "/")
+	if prefix == "" || !strings.Contains(prefix, "://") {
+		return raw
+	}
+	return prefix + "/" + raw
+}
+
+// downloadSources 给出「下载这个资产」要依次尝试的完整地址。
+// 上次成功的源排第一：国内一旦换到镜像，后续更新就不必再等直连超时一次。
+func downloadSources(raw string) []string {
+	out := make([]string, 0, len(updateMirrors)+2)
+	seen := map[string]bool{}
+	add := func(p string) {
+		u := mirrorURL(p, raw)
+		if !seen[u] {
+			seen[u] = true
+			out = append(out, u)
+		}
+	}
+	if s := strings.TrimSpace(os.Getenv("WBONE_UPDATE_MIRROR")); s != "" {
+		add(s)
+	}
+	if s := readPrefs().UpdateMirror; strings.TrimSpace(s) != "" {
+		add(s)
+	}
+	add("") // 直连
+	for _, m := range updateMirrors {
+		add(m)
+	}
+	return out
+}
+
+// releasePages 查版本要依次尝试的页面地址（直连 + 各加速源）。
+// 查版本同样是「国内不通」的重灾区，不能只赌 github.com。
+func releasePages() []string {
+	out := make([]string, 0, len(updateMirrors)+1)
+	add := func(p string) {
+		u := mirrorURL(p, updateLatestPage)
+		for _, e := range out {
+			if e == u {
+				return
+			}
+		}
+		out = append(out, u)
+	}
+	add("")
+	for _, m := range updateMirrors {
+		add(m)
+	}
+	return out
+}
+
 func updateFeedURL() string {
 	if s := strings.TrimSpace(os.Getenv("WBONE_UPDATE_FEED")); s != "" {
 		return s
@@ -166,16 +238,71 @@ func updateDownloadClient() *http.Client {
 // 自定义 feed（update_feed / WBONE_UPDATE_FEED）仍按 GitHub API 的 JSON 形状解析。
 func fetchRelease() (*ghRelease, error) {
 	feed := updateFeedURL()
-	if feed == updateDefaultFeed {
-		rel, err := releaseFromRedirect()
-		if err == nil {
-			return rel, nil
-		}
-		// 零配额路径失手（企业代理改写跳转、页面结构变了等）再走 API，
-		// 这时才可能吃限流——但至少不是主路径。
-		logf("零配额查版本失败（%v），改用 GitHub API", err)
+	if feed != updateDefaultFeed {
+		return fetchReleaseAPI(feed)
 	}
+	rel, err := fetchReleaseFast(releasePages())
+	if err == nil {
+		return rel, nil
+	}
+	// 直连和所有加速源都没拿到（企业代理改写跳转、页面结构变了等）再走 API，
+	// 这时才可能吃限流——但至少不是主路径。
+	logf("查版本失败（直连 + %d 个加速源）：%v，改用 GitHub API", len(updateMirrors), err)
 	return fetchReleaseAPI(feed)
+}
+
+// fetchReleaseFast 并发去问所有源，取窗口内版本号最大的那个。
+//
+// 为什么并发：国内直连 github.com 经常是「连接建立后干等」，串行试五个源
+// 要等一分多钟，用户会以为按钮卡死了。
+// 为什么取最大版本而不是取最先返回：公共加速源会缓存旧页面，先到的未必最新。
+func fetchReleaseFast(pages []string) (*ghRelease, error) {
+	type result struct {
+		rel *ghRelease
+		err error
+	}
+	ch := make(chan result, len(pages))
+	for _, p := range pages {
+		go func(p string) {
+			rel, err := releaseFromRedirectURL(p)
+			ch <- result{rel, err}
+		}(p)
+	}
+
+	var best *ghRelease
+	var lastErr error
+	// 总窗口 12 秒：正常情况 1~3 秒就有应答，这里只是防止某个源吊着不回，
+	// 把「检查更新」卡死。比单源的 10 秒超时略长，保证窗口关掉前每源都已出结果。
+	timer := time.NewTimer(12 * time.Second)
+	defer timer.Stop()
+	for i := 0; i < len(pages); i++ {
+		select {
+		case r := <-ch:
+			if r.err != nil {
+				if lastErr == nil {
+					lastErr = r.err
+				}
+				continue
+			}
+			if best == nil || newerTag(r.rel.Tag, best.Tag) {
+				best = r.rel
+			}
+		case <-timer.C:
+			i = len(pages) // 跳出：用已经拿到的
+		}
+	}
+	if best != nil {
+		return best, nil
+	}
+	if lastErr == nil {
+		lastErr = errors.New("没有可用的更新源")
+	}
+	return nil, lastErr
+}
+
+// newerTag a 是否比 b 新。
+func newerTag(a, b string) bool {
+	return versionLess(strings.TrimPrefix(b, "v"), strings.TrimPrefix(a, "v"))
 }
 
 // releaseFromRedirect 用「releases/latest 的 302」拿 tag，零 API 配额。
@@ -188,7 +315,10 @@ func releaseFromRedirectURL(page string) (*ghRelease, error) {
 	}
 	req.Header.Set("User-Agent", "WorkBuddyOne/"+appVersion)
 	c := &http.Client{
-		Timeout: 20 * time.Second,
+		// 与 fetchReleaseFast 的窗口对齐：单源最多 10 秒，窗口 12 秒，
+		// 保证窗口关掉之前每个源都已经给出结果（成功或超时）。
+		// 国内不通的源永远是「连上了但不回」，多等没有意义。
+		Timeout: 10 * time.Second,
 		// 关键：不要跟随跳转，Location 里就有 tag。
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 	}
@@ -476,8 +606,15 @@ func downloadAndStage() (string, error) {
 	zipPath := filepath.Join(dir, asset)
 
 	updGot.Store(0)
-	if err := downloadFile(url, zipPath, updateMaxZipBytes, want); err != nil {
+	used, err := downloadAnySource(url, zipPath, updateMaxZipBytes, want)
+	if err != nil {
 		return "", err
+	}
+	// 记住这次成功的源。国内一旦换到加速源，后面每次更新就不必再在
+	// 直连上白等一轮超时——这个体验差别很大。
+	if p := readPrefs(); p.UpdateMirror != mirrorOf(used, url) {
+		p.UpdateMirror = mirrorOf(used, url)
+		writePrefs(p)
 	}
 	staged, err := extractExe(zipPath, dir)
 	if err != nil {
@@ -486,6 +623,85 @@ func downloadAndStage() (string, error) {
 	_ = os.Remove(zipPath) // 装完就不留 4MB 的包在数据目录里
 	logf("已下载 v%s 安装包并取出程序：%s", latest, filepath.Base(staged))
 	return staged, nil
+}
+
+// sourceLabel 给日志/报错用的源名字。直连和加速源在用户看来是两回事。
+func sourceLabel(u, raw string) string {
+	if p := mirrorOf(u, raw); p != "" {
+		return "加速源 " + strings.TrimPrefix(p, "https://")
+	}
+	if host := hostOf(u); host != "" {
+		return host
+	}
+	return "直连"
+}
+
+func hostOf(u string) string {
+	if i := strings.Index(u, "://"); i >= 0 {
+		u = u[i+3:]
+	}
+	if j := strings.IndexAny(u, "/?#"); j >= 0 {
+		u = u[:j]
+	}
+	return u
+}
+
+// mirrorOf 由「实际下载地址」反解出用了哪个加速前缀；直连返回空串。
+func mirrorOf(used, raw string) string {
+	if used == raw {
+		return ""
+	}
+	if strings.HasSuffix(used, "/"+raw) {
+		return strings.TrimSuffix(used, "/"+raw)
+	}
+	return ""
+}
+
+// downloadAnySource 依次尝试「上次成功的源 → 直连 → 各加速源」，直到下完。
+//
+// 换源时一律删掉残包重下：不同源对 Range 的处理不一致，把一个源的下半截
+// 拼到另一个源上，只会得到一个 CRC 对不上的包。
+// 但同一个源内部如果已经下到字节再断，就走续传——那是「通、只是慢」的源，
+// 换掉反而更亏。
+func downloadAnySource(raw, dst string, limit, want int64) (string, error) {
+	srcs := downloadSources(raw)
+	var fails []string
+	for i, u := range srcs {
+		if i > 0 {
+			_ = os.Remove(dst)
+			logf("上一个下载源不可用，换 %s", sourceLabel(u, raw))
+		}
+		for try := 1; try <= updateTries; try++ {
+			err := downloadOnce(u, dst, limit, want)
+			if err == nil {
+				if i > 0 {
+					logf("已通过 %s 下载完成", sourceLabel(u, raw))
+				}
+				return u, nil
+			}
+			if !downloadRetriable(err) {
+				fails = append(fails, sourceLabel(u, raw)+"："+err.Error())
+				break // 这个源明确不行（4xx/内容不对），换下一个
+			}
+			// 一个字节都没下来 = 这个源根本连不上，别在它身上耗重试次数。
+			if st, serr := os.Stat(dst); serr != nil || st.Size() == 0 {
+				fails = append(fails, sourceLabel(u, raw)+"："+err.Error())
+				break
+			}
+			if try == updateTries {
+				fails = append(fails, sourceLabel(u, raw)+"："+err.Error())
+				break
+			}
+			logf("%s 下载中断（%v），%v 后续传", sourceLabel(u, raw), err, updateRetryWait)
+			time.Sleep(updateRetryWait)
+		}
+	}
+	_ = os.Remove(dst)
+	if len(fails) > 4 {
+		fails = fails[:2] // 报错别把五个源的原因全糊上去，留最容易看懂的前两条
+	}
+	return "", fmt.Errorf("所有下载源都失败了（%s）。可以稍后重试，或到 Release 页手动下载",
+		strings.Join(fails, "；"))
 }
 
 // ── 下载 ────────────────────────────────────────────────────────────
@@ -803,11 +1019,18 @@ func checkPEFile(p string) error {
 // 「exe 不见了」的状态。
 func applyStaged(newExe string) error {
 	target := selfExePath()
-	old := target + ".old"
-	_ = os.Remove(old)
+	// 备份名必须唯一，不能固定用 ".old"。
+	//
+	// 固定名撞过一个很隐蔽的状态：上一次更新把「正在运行的 exe」改名成 .old
+	// 并删除之后，这个名字处于 delete-pending（进程映像还被引用着）——目录里
+	// 看不见它，但它既不能被创建，也不能作为 MOVEFILE_REPLACE_EXISTING 的目标。
+	// 于是这次的 os.Rename 直接返回 Access is denied，更新原地失败。
+	// 用户看到的就是「点更新 → 窗口没了 → 程序再也没起来」。
+	// 实测日志：11:24:04「无法移动当前程序：rename ... Access is denied」。
+	old := backupPath(target)
 
 	if err := os.Rename(target, old); err != nil {
-		return fmt.Errorf("无法移动当前程序：%w（目录只读或被占用？）", err)
+		return fmt.Errorf("无法移动当前程序（目录只读，或被杀毒软件锁住）：%w", err)
 	}
 	if err := os.Rename(newExe, target); err != nil {
 		_ = os.Rename(old, target)
@@ -847,20 +1070,40 @@ func handoffWait() {
 	logf("接棒启动：等待端口 %s 超时，继续尝试启动", appPort)
 }
 
-// cleanupOldExe 删掉上一次更新留下的 .old。旧进程可能还没退干净，
-// 所以失败就等一会儿再试，删不掉也无所谓——下次启动还会再试。
+// backupPath 给「被替换掉的旧 exe」起一个绝不会重名的备份名。
+//
+// 为什么不能用固定名 ".old"：上一次更新把正在运行的 exe 改名成 .old 并删除后，
+// 那个名字会停在 delete-pending 状态（进程映像还被引用）。目录里看不到它，
+// 但它既不能被创建、也不能作为 MOVEFILE_REPLACE_EXISTING 的目标 —— 于是
+// 下一次 rename 直接 Access is denied。pid + 自增序号保证永不撞名，
+// 而 cleanupOldExe 用 "*.old-*" 通配统一清理。
+func backupPath(target string) string {
+	return fmt.Sprintf("%s.old-%d-%d", target, os.Getpid(), updBackupSeq.Add(1))
+}
+
+var updBackupSeq atomic.Int64
+
+// cleanupOldExe 删掉上一次更新留下的备份。
+// 旧进程可能还没退干净，所以失败就等一会儿再试，删不掉也无所谓——下次启动还会再试。
 func cleanupOldExe() {
-	old := selfExePath() + ".old"
-	for i := 0; i < 20; i++ {
-		err := os.Remove(old)
-		if err == nil {
-			logf("已清理更新备份 %s", filepath.Base(old))
-			return
+	target := selfExePath()
+	// 1.0.7 及以前用固定名 .old；1.0.8 起带时间戳后缀。两种都清。
+	candidates := []string{target + ".old"}
+	if m, err := filepath.Glob(target + ".old-*"); err == nil {
+		candidates = append(candidates, m...)
+	}
+	for _, old := range candidates {
+		for i := 0; i < 20; i++ {
+			err := os.Remove(old)
+			if err == nil {
+				logf("已清理更新备份 %s", filepath.Base(old))
+				break
+			}
+			if os.IsNotExist(err) {
+				break
+			}
+			time.Sleep(500 * time.Millisecond)
 		}
-		if os.IsNotExist(err) {
-			return
-		}
-		time.Sleep(500 * time.Millisecond)
 	}
 }
 
@@ -883,19 +1126,25 @@ func beginApply(latest string) error {
 		return err
 	}
 	go func() {
-		// 留一点时间把响应和提示送出去，再关窗口。
+		// 留一点时间把响应和提示送出去。
 		time.Sleep(1200 * time.Millisecond)
-		if browser != nil && browser.Process != nil {
-			_ = browser.Process.Kill()
-		}
+
+		// 顺序是刻意的：**先换文件并拉起新进程，成功了才关窗口**。
+		// 以前是先 Kill 浏览器再换文件，于是换文件一失败就变成
+		// 「窗口没了、进程也被窗口退出回调带走、新版本根本没起来」——
+		// 用户看到的就是「更新完就再也不启动了」。失败时必须原样留着窗口。
 		if err := applyStaged(staged); err != nil {
 			logf("自动更新失败：%v", err)
 			setApplying(false, err.Error())
+			_ = os.Remove(staged) // 残包不留，下次重下
 			return
 		}
-		logf("已更新到 v%s，交给新版本接棒", latest)
-		// 不删 browserProfile：此刻目录还被系统占着，新进程启动时
-		// cleanStaleBrowserProfiles 会收拾。端口随进程退出释放。
+		logf("已更新到 v%s，新版本已拉起，关闭旧窗口", latest)
+		if browser != nil && browser.Process != nil {
+			_ = browser.Process.Kill()
+		}
+		// 等窗口退出回调打完日志再走；端口随本进程退出释放，新进程在 handoffWait 里等它。
+		time.Sleep(400 * time.Millisecond)
 		os.Exit(0)
 	}()
 	return nil
