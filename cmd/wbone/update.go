@@ -79,8 +79,6 @@ type updateState struct {
 	Checking  bool   `json:"checking"`
 	Applying  bool   `json:"applying"`
 	Error     string `json:"error,omitempty"`
-	AutoCheck bool   `json:"auto_check"`
-	AutoApply bool   `json:"auto_apply"`
 	Feed      string `json:"feed,omitempty"`
 }
 
@@ -111,6 +109,15 @@ var (
 
 // ── 查询 ────────────────────────────────────────────────────────────
 
+const (
+	// updateDefaultFeed 官方默认源。匿名调用 api.github.com 是**按 IP 每小时
+	// 60 次**，多开几次「检查更新」就会 403 rate limit——所以默认路径根本不
+	// 碰这个接口，见 fetchRelease。
+	updateDefaultFeed = "https://api.github.com/repos/" + updateRepo + "/releases/latest"
+	// updateLatestPage 会 302 到 /releases/tag/vX.Y.Z。读这个跳转不消耗 API 配额。
+	updateLatestPage = "https://github.com/" + updateRepo + "/releases/latest"
+)
+
 func updateFeedURL() string {
 	if s := strings.TrimSpace(os.Getenv("WBONE_UPDATE_FEED")); s != "" {
 		return s
@@ -118,7 +125,16 @@ func updateFeedURL() string {
 	if s := strings.TrimSpace(readPrefs().UpdateFeed); s != "" {
 		return s
 	}
-	return "https://api.github.com/repos/" + updateRepo + "/releases/latest"
+	return updateDefaultFeed
+}
+
+// githubToken 可选的 GitHub token。配了就走认证配额（5000/小时），
+// 不配也能用——默认路径压根不走 API。
+func githubToken() string {
+	if s := strings.TrimSpace(os.Getenv("WBONE_UPDATE_TOKEN")); s != "" {
+		return s
+	}
+	return strings.TrimSpace(readPrefs().UpdateToken)
 }
 
 // updateClient 查 Release 元数据的 client。这一步只是拿几 KB 的 JSON，
@@ -141,18 +157,118 @@ func updateDownloadClient() *http.Client {
 	return &http.Client{Timeout: 0, Transport: cp}
 }
 
+// fetchRelease 取最新版本信息。
+//
+// 默认源**先走零配额路径**：读 github.com/releases/latest 的 302 Location 拿 tag，
+// 再按固定命名规则拼出下载地址。全程不碰 api.github.com，也就不会被
+// 「匿名每小时 60 次」的限流卡住（用户实际报过 403 rate limit）。
+//
+// 自定义 feed（update_feed / WBONE_UPDATE_FEED）仍按 GitHub API 的 JSON 形状解析。
 func fetchRelease() (*ghRelease, error) {
-	req, err := http.NewRequest(http.MethodGet, updateFeedURL(), nil)
+	feed := updateFeedURL()
+	if feed == updateDefaultFeed {
+		rel, err := releaseFromRedirect()
+		if err == nil {
+			return rel, nil
+		}
+		// 零配额路径失手（企业代理改写跳转、页面结构变了等）再走 API，
+		// 这时才可能吃限流——但至少不是主路径。
+		logf("零配额查版本失败（%v），改用 GitHub API", err)
+	}
+	return fetchReleaseAPI(feed)
+}
+
+// releaseFromRedirect 用「releases/latest 的 302」拿 tag，零 API 配额。
+func releaseFromRedirect() (*ghRelease, error) { return releaseFromRedirectURL(updateLatestPage) }
+
+func releaseFromRedirectURL(page string) (*ghRelease, error) {
+	req, err := http.NewRequest(http.MethodGet, page, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", "WorkBuddyOne/"+appVersion)
+	c := &http.Client{
+		Timeout: 20 * time.Second,
+		// 关键：不要跟随跳转，Location 里就有 tag。
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
+	resp, err := c.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("连接 GitHub 失败：%w", err)
+	}
+	defer resp.Body.Close()
+
+	if tag := tagFromReleaseURL(resp.Header.Get("Location")); tag != "" {
+		return releaseForTag(tag), nil
+	}
+	// 有些代理会把 302 拆掉直接回 200 页面内容，再从正文里找一次。
+	if resp.StatusCode == http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 256<<10))
+		if tag := tagFromReleaseURL(string(body)); tag != "" {
+			return releaseForTag(tag), nil
+		}
+		return nil, fmt.Errorf("GitHub 返回了页面但找不到版本号（HTTP %d）", resp.StatusCode)
+	}
+	return nil, fmt.Errorf("GitHub 未按预期跳转（HTTP %d）", resp.StatusCode)
+}
+
+// tagFromReleaseURL 从 "/releases/tag/v1.0.6" 这类地址（或整页 HTML）里抠出 tag。
+func tagFromReleaseURL(s string) string {
+	const marker = "/releases/tag/"
+	i := strings.Index(s, marker)
+	if i < 0 {
+		return ""
+	}
+	tag := s[i+len(marker):]
+	if j := strings.IndexAny(tag, "\"?#/' "); j >= 0 {
+		tag = tag[:j]
+	}
+	tag = strings.TrimSpace(tag)
+	// 只接受 vX.Y.Z 形状，避免把 "latest" 之类当成版本。
+	if !strings.HasPrefix(tag, "v") || len(versionNums(tag)) == 0 {
+		return ""
+	}
+	return tag
+}
+
+// releaseForTag 由 tag 直接拼出资产地址。仓库的资产命名是固定的
+// WorkBuddyOne-vX.Y.Z-win64.zip，所以不需要 API 告诉我们有哪些资产。
+// Size 留 0：下载层会以 zip 的 CRC 兜底完整性，拿不到大小只是少一道预检。
+func releaseForTag(tag string) *ghRelease {
+	v := strings.TrimPrefix(tag, "v")
+	asset := updateAssetPrefix + v + updateAssetSuffix
+	return &ghRelease{
+		Tag:  tag,
+		Page: "https://github.com/" + updateRepo + "/releases/tag/" + tag,
+		Assets: []ghAsset{{
+			Name: asset,
+			URL:  "https://github.com/" + updateRepo + "/releases/download/" + tag + "/" + asset,
+		}},
+	}
+}
+
+// fetchReleaseAPI 走 GitHub REST API（GitHub API 形状的自定义源也走这里）。
+func fetchReleaseAPI(feed string) (*ghRelease, error) {
+	req, err := http.NewRequest(http.MethodGet, feed, nil)
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Accept", "application/vnd.github+json")
 	req.Header.Set("User-Agent", "WorkBuddyOne/"+appVersion)
+	if tok := githubToken(); tok != "" {
+		req.Header.Set("Authorization", "Bearer "+tok)
+	}
 	resp, err := updateClient().Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("连接更新源失败（检查网络或代理）：%w", err)
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusTooManyRequests {
+		// 这基本只有一个原因：匿名接口按 IP 限流（60 次/小时）。
+		// 说清楚怎么办，别把 GitHub 的英文原文糊到用户脸上。
+		return nil, fmt.Errorf("GitHub 接口被限流了（匿名每小时 60 次，按 IP 算）。" +
+			"稍等一小时再试即可，或在 data/prefs.json 里加 \"update_token\": \"<你的 GitHub token>\" 提高额度")
+	}
 	if resp.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 300))
 		return nil, fmt.Errorf("更新源返回 %d：%s", resp.StatusCode, strings.TrimSpace(string(b)))
@@ -222,10 +338,14 @@ func checkUpdate(force bool) updateState {
 	updState.Notes = truncateRunes(strings.TrimSpace(rel.Body), 600)
 	updState.Asset, updAssetURL, updState.AssetSize = pickAsset(rel)
 
-	// 记下检查时间，供「每天最多自动查一次」使用。
-	p := readPrefs()
-	p.LastUpdateCheck = time.Now().Unix()
-	writePrefs(p)
+	// 只有「确实没有新版本」才记检查时间。
+	// 查到新版本却没装成（下载失败、进程被杀）时不记——否则要空等 24 小时
+	// 才会重试，用户就永远卡在这个版本上了。
+	if !updState.HasUpdate {
+		p := readPrefs()
+		p.LastUpdateCheck = time.Now().Unix()
+		writePrefs(p)
+	}
 	return updState
 }
 
@@ -234,8 +354,6 @@ func currentUpdateState() updateState {
 	s := updState
 	updMu.Unlock()
 	s.Current = appVersion
-	s.AutoCheck = autoCheckEnabled()
-	s.AutoApply = autoApplyEnabled()
 	s.Feed = updateFeedURL()
 	if s.Applying {
 		s.GotBytes = updGot.Load()
@@ -243,17 +361,12 @@ func currentUpdateState() updateState {
 	return s
 }
 
-func autoCheckEnabled() bool { return !readPrefs().UpdateCheckOff }
-
-// autoApplyEnabled 查到新版本后是否直接安装（含自动重启）。默认关。
-func autoApplyEnabled() bool { return readPrefs().UpdateAutoApply }
-
-// autoCheckOnce 启动后台静默检查：没开开关、或 24 小时内查过就跳过。
-// 开了「自动安装」时，查到新版本就在这里直接换掉自己并重启——不需要用户点。
+// autoCheckOnce 启动时的后台检查：24 小时内查过就跳过。
+//
+// 更新是**全自动**的：查到新版本直接下载、替换、重启，没有开关。
+// （1.0.6 之前有个「自动安装」勾选，默认关。结果大部分人永远不勾，
+// 于是一直停留在老版本上——而老版本的更新本身还是坏的，形成死循环。）
 func autoCheckOnce() {
-	if !autoCheckEnabled() {
-		return
-	}
 	if p := readPrefs(); p.LastUpdateCheck > 0 &&
 		time.Since(time.Unix(p.LastUpdateCheck, 0)) < updateAutoGap {
 		return
@@ -262,12 +375,8 @@ func autoCheckOnce() {
 	if !st.HasUpdate {
 		return
 	}
-	logf("发现新版本 v%s（当前 v%s）", st.Latest, appVersion)
-	if !autoApplyEnabled() {
-		return
-	}
-	// 自动安装：这一步会关窗口、换 exe、重启自己，所以放在后台，别堵住启动流程。
-	logf("自动安装已开启，开始下载 v%s", st.Latest)
+	logf("发现新版本 v%s（当前 v%s），开始自动更新", st.Latest, appVersion)
+	// 这一步会关窗口、换 exe、重启自己，所以放后台，别堵住启动流程。
 	setApplying(true, "")
 	latest := st.Latest
 	go func() {
@@ -809,7 +918,6 @@ func registerUpdate(mux *http.ServeMux) {
 			return
 		}
 		st.Current = appVersion
-		st.AutoCheck = autoCheckEnabled()
 		writeJSON(w, st)
 	})
 	// 下载 + 替换 + 重启。下载在本次响应里同步完成（失败能立刻回给界面），
@@ -844,41 +952,5 @@ func registerUpdate(mux *http.ServeMux) {
 			"restarting": true,
 			"latest":     latest,
 		})
-	})
-	// 打开/关闭「查到就自动安装」。打开后会连重启一起做掉，用户什么都不用点。
-	mux.HandleFunc("POST /accounts/api/update/auto_apply", func(w http.ResponseWriter, r *http.Request) {
-		lastSeen.Store(time.Now().UnixNano())
-		var req struct {
-			Enabled bool `json:"enabled"`
-		}
-		_ = json.NewDecoder(r.Body).Decode(&req)
-		p := readPrefs()
-		p.UpdateAutoApply = req.Enabled
-		// 自动安装依赖自动检查：只开安装在关掉检查的话，永远查不到、也就不会装。
-		if req.Enabled {
-			p.UpdateCheckOff = false
-		}
-		writePrefs(p)
-		msg := "已关闭自动安装，更新改为提示后由你点"
-		if req.Enabled {
-			msg = "已开启自动安装：每天启动后查到新版本会直接更新并重启"
-		}
-		writeJSON(w, map[string]any{"ok": true, "message": msg, "enabled": req.Enabled})
-	})
-	// 关掉/打开每日自动检查。
-	mux.HandleFunc("POST /accounts/api/update/auto", func(w http.ResponseWriter, r *http.Request) {
-		lastSeen.Store(time.Now().UnixNano())
-		var req struct {
-			Enabled bool `json:"enabled"`
-		}
-		_ = json.NewDecoder(r.Body).Decode(&req)
-		p := readPrefs()
-		p.UpdateCheckOff = !req.Enabled
-		writePrefs(p)
-		msg := "已关闭自动检查更新"
-		if req.Enabled {
-			msg = "已开启：每天启动后自动检查一次"
-		}
-		writeJSON(w, map[string]any{"ok": true, "message": msg, "enabled": req.Enabled})
 	})
 }

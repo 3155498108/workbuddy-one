@@ -289,12 +289,14 @@ func backupDBOnce(path string) error {
 type prefs struct {
 	ShareConversations bool `json:"share_conversations"`
 
-	// 更新相关（update.go）。零值即默认行为，老版本读新文件、新版本读老文件
-	// 都不会出错：没写过 = 开着自动检查、24 小时没查过、不自动安装。
-	UpdateCheckOff  bool   `json:"update_check_off,omitempty"`
-	UpdateAutoApply bool   `json:"update_auto_apply,omitempty"` // 查到就自动装（会重启）
+	// 更新相关（update.go）。
+	//
+	// V1.0.7 起更新是全自动的（查到就装、装完自己重启），原来那两个开关
+	// update_check_off / update_auto_apply 已经删掉——留着只会让人以为
+	// 自己能关掉，实际关不掉。老 prefs.json 里残留这两个键会被忽略。
 	LastUpdateCheck int64  `json:"last_update_check,omitempty"` // unix 秒
 	UpdateFeed      string `json:"update_feed,omitempty"`       // 自定义更新源（GitHub API 形状）
+	UpdateToken     string `json:"update_token,omitempty"`      // GitHub token，仅用于提高 API 额度
 }
 
 func prefsPath() string { return filepath.Join(baseDir(), "data", "prefs.json") }

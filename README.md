@@ -15,7 +15,7 @@
 
 不想装 Go 自己编译的，直接拿现成的：
 
-**[Releases](https://github.com/3155498108/workbuddy-one/releases)** → `WorkBuddyOne-v1.0.6-win64.zip`（约 4.1 MB）
+**[Releases](https://github.com/3155498108/workbuddy-one/releases)** → `WorkBuddyOne-v1.0.7-win64.zip`（约 4.1 MB）
 
 解压后双击 `WorkBuddyOne.exe` 就能用，**不需要装 Go、Node 或任何运行时**——界面是调用系统自带的
 Edge（或 Chrome）以 `--app` 模式显示，Windows 10/11 上本来就有。首次运行会在同目录自动生成
@@ -116,16 +116,21 @@ WorkBuddy 的对话按账号隔离：`~/.workbuddy/workbuddy.db` 的 `sessions` 
 
 ### 4. 自动更新
 
-侧栏底部一直显示当前版本。每天启动后静默查一次有没有新版本，只有查到才变蓝；
-点一下就能下载替换、自动重启，**只换 exe，账号快照、配置、对话记录都不动**。
-
-嫌每次都要点的话，那一行下面有个「自动安装」勾选：打开后就变成真·全自动——
-每天启动时查到新版本直接换、自己重启，窗口关一次再出现，不用管它。
+侧栏底部一直显示当前版本。**全自动**：每天启动后静默查一次，查到新版本就直接
+下载、替换、自己重启——窗口关一次再出现，不用点任何按钮。
+**只换 exe，账号快照、配置、对话记录都不动**。
 
 几个刻意做成这样的地方：
 
-- **自动安装默认关**。替换 exe 必须重启管家，你正在切号时被重启会打断操作，
-  所以默认只提示、装不装由你点；愿意让它自己装的人再勾上。
+- **没有「要不要自动装」的开关**。1.0.6 之前有，默认还是关的；结果是大部分人
+  永远不勾，于是永远停在老版本上，而老版本的更新本身又是坏的——死循环。
+  现在固定全自动，只保留「点一下立即检查」的手动入口。
+- **查版本不走 API**。匿名调用 `api.github.com` 是**按 IP 每小时 60 次**，
+  很容易 403 `rate limit exceeded`（用户实际撞过）。默认路径改成读
+  `github.com/<repo>/releases/latest` 的 302 `Location` 拿 tag，再按固定命名
+  拼出下载地址——全程不碰 API，没有配额问题。代理把 302 拆成 200 时，
+  还会从页面正文里再找一次。API 只在自定义 `update_feed` 或零配额路径失手时兜底，
+  可选配 `update_token` 提高额度。
 - **下载按「有没有进展」判定失败，不设总时长**。`http.Client.Timeout` 计的是整个
   请求（含读完 body），慢速下载会被它从中间掐断——v1.0.3~v1.0.5 更新失败报的
   `context deadline exceeded ... while reading body` 全是这个。现在只有「连续 25 秒
@@ -143,7 +148,8 @@ WorkBuddy 的对话按账号隔离：`~/.workbuddy/workbuddy.db` 的 `sessions` 
 
 更新源默认是 GitHub Release 的 `latest`，连不上（比如没代理）会明确报错、不影响正常使用。
 要换镜像可以设环境变量 `WBONE_UPDATE_FEED` 或在 `data/prefs.json` 里写 `update_feed`
-（格式同 GitHub `releases/latest` 的响应）。自动安装记录在 `update_auto_apply`。
+（格式同 GitHub `releases/latest` 的响应）。撞上 API 限流时可加 `update_token`
+（GitHub token）提高额度——默认路径用不到它。
 
 ### 5. 任务中心：新任务自动跟上
 
@@ -193,7 +199,7 @@ go-winres simply --arch amd64 --out wbone --manifest gui \
   --icon app.ico \
   --product-name "WorkBuddy 管家" \
   --file-description "WorkBuddy 客户端账号切换 + API 面板" \
-  --file-version 1.0.6 --product-version 1.0.6 \
+  --file-version 1.0.7 --product-version 1.0.7 \
   --original-filename WorkBuddyOne.exe \
   --copyright "MIT License"
 mv wbone_windows_amd64.syso rsrc.syso

@@ -1,8 +1,12 @@
 package main
 
 import (
+	"net/http"
+	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestVersionNums(t *testing.T) {
@@ -98,45 +102,132 @@ func TestShellHTMLPlaceholders(t *testing.T) {
 	if !strings.Contains(html, "btnUpd") {
 		t.Fatal("界面缺少更新按钮")
 	}
-}
-
-// TestAutoApplyPrefRoundTrip 「自动安装」偏好必须能写能读，且默认是关的。
-// 默认开会让所有人在升级后莫名其妙被重启一次。
-func TestAutoApplyPrefRoundTrip(t *testing.T) {
-	dir := t.TempDir()
-	old := exeDir
-	exeDir = dir
-	defer func() { exeDir = old }()
-
-	if autoApplyEnabled() {
-		t.Fatal("没有 prefs.json 时自动安装必须是关的（零值默认）")
+	// V1.0.7 起更新全自动，「自动安装」勾选已移除。它要是又冒出来，
+	// 说明有人把可关闭的半自动逻辑加回来了。
+	if strings.Contains(html, "chkAutoApply") || strings.Contains(html, "updAutoBox") {
+		t.Fatal("界面上不应再有「自动安装」开关")
 	}
-	p := readPrefs()
-	p.UpdateAutoApply = true
-	writePrefs(p)
-	if !autoApplyEnabled() {
-		t.Fatal("写入后应读到开启状态")
-	}
-	p = readPrefs()
-	p.UpdateAutoApply = false
-	writePrefs(p)
-	if autoApplyEnabled() {
-		t.Fatal("写入关闭后不应再读成开启")
+	if strings.Contains(html, "/update/auto_apply") {
+		t.Fatal("界面不该再调用已删除的 auto_apply 接口")
 	}
 }
 
-// TestAutoApplyImpliesCheck 自动安装依赖自动检查：只开安装、关掉检查的话，
-// 永远查不到新版本，开关会静默失效。接口里已经强制把检查打开，这里锁住 prefs 语义。
-func TestAutoApplyImpliesCheck(t *testing.T) {
-	dir := t.TempDir()
-	old := exeDir
-	exeDir = dir
-	defer func() { exeDir = old }()
-
-	writePrefs(prefs{UpdateCheckOff: true, UpdateAutoApply: true})
-	// 组合本身是合法的（两项独立存储），但一旦这样写就没有更新可能——
-	// 接口侧必须把 UpdateCheckOff 清掉。这里验证 autoCheckEnabled 会如实反映。
-	if autoCheckEnabled() {
-		t.Fatal("UpdateCheckOff=true 时 autoCheckEnabled 应为 false")
+func TestTagFromReleaseURL(t *testing.T) {
+	cases := map[string]string{
+		"https://github.com/o/r/releases/tag/v1.0.6":     "v1.0.6",
+		"https://github.com/o/r/releases/tag/v1.0.6?x=1": "v1.0.6",
+		`<a href="/o/r/releases/tag/v2.3.4">latest</a>`:  "v2.3.4",
+		"https://github.com/o/r/releases":                "",
+		"https://github.com/o/r/releases/tag/latest":     "",
+		"": "",
 	}
+	for in, want := range cases {
+		if got := tagFromReleaseURL(in); got != want {
+			t.Errorf("tagFromReleaseURL(%q)=%q want %q", in, got, want)
+		}
+	}
+}
+
+// TestReleaseForTag 不查 API 时要能自己拼出正确的资产名和地址。
+func TestReleaseForTag(t *testing.T) {
+	rel := releaseForTag("v1.2.3")
+	if rel.Tag != "v1.2.3" {
+		t.Errorf("Tag=%q", rel.Tag)
+	}
+	name, url, _ := pickAsset(rel)
+	if name != "WorkBuddyOne-v1.2.3-win64.zip" {
+		t.Errorf("asset 名拼错：%q", name)
+	}
+	if !strings.HasSuffix(url, "/releases/download/v1.2.3/WorkBuddyOne-v1.2.3-win64.zip") {
+		t.Errorf("下载地址拼错：%q", url)
+	}
+}
+
+// TestReleaseFromRedirect 零配额路径：读 302 的 Location 拿 tag，不解析 API JSON。
+func TestReleaseFromRedirect(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "https://github.com/o/r/releases/tag/v1.2.3", http.StatusFound)
+	}))
+	defer srv.Close()
+
+	rel, err := releaseFromRedirectURL(srv.URL)
+	if err != nil {
+		t.Fatalf("应能从 302 拿到版本：%v", err)
+	}
+	if rel.Tag != "v1.2.3" {
+		t.Errorf("Tag=%q want v1.2.3", rel.Tag)
+	}
+}
+
+// TestReleaseFromRedirectProxyStrips302 有些代理会把 302 拆掉直接回 200 页面，
+// 这时要从正文里再找一次，不能直接判失败。
+func TestReleaseFromRedirectProxyStrips302(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		w.Write([]byte(`<html><a href="/o/r/releases/tag/v1.4.0">v1.4.0</a></html>`))
+	}))
+	defer srv.Close()
+
+	rel, err := releaseFromRedirectURL(srv.URL)
+	if err != nil {
+		t.Fatalf("200 页面里也应能抠出版本号：%v", err)
+	}
+	if rel.Tag != "v1.4.0" {
+		t.Errorf("Tag=%q want v1.4.0", rel.Tag)
+	}
+}
+
+// TestRateLimitMessage API 兜底撞上 403 时，报错要说人话——
+// 别把 GitHub 那串英文原文糊给用户。
+func TestRateLimitMessage(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		w.Write([]byte(`{"message":"API rate limit exceeded for 1.2.3.4."}`))
+	}))
+	defer srv.Close()
+
+	_, err := fetchReleaseAPI(srv.URL)
+	if err == nil {
+		t.Fatal("403 应当报错")
+	}
+	msg := err.Error()
+	if strings.Contains(msg, "rate limit exceeded") {
+		t.Errorf("不该把英文原文直接抛给用户：%s", msg)
+	}
+	if !strings.Contains(msg, "限流") || !strings.Contains(msg, "update_token") {
+		t.Errorf("报错应说明是限流并给出解法，实际：%s", msg)
+	}
+}
+
+// TestReleaseFromRedirectReal 真打 github.com 验证零配额路径。
+// 设 WBONE_REAL_TAG=1 才跑（要联网）。这条路径不该消耗 API 配额，
+// 也就不会 403 rate limit——用户报的正是这个。
+func TestReleaseFromRedirectReal(t *testing.T) {
+	if os.Getenv("WBONE_REAL_TAG") != "1" {
+		t.Skip("未设置 WBONE_REAL_TAG")
+	}
+	rel, err := releaseFromRedirect()
+	if err != nil {
+		t.Fatalf("零配额查版本失败：%v", err)
+	}
+	name, url, _ := pickAsset(rel)
+	t.Logf("tag=%s asset=%s", rel.Tag, name)
+	if rel.Tag == "" || name == "" {
+		t.Fatal("没拿到版本或资产名")
+	}
+	// 拼出来的下载地址必须是真实存在的（HEAD 不跟随跳转，302 即表示有货）。
+	req, _ := http.NewRequest(http.MethodHead, url, nil)
+	c := &http.Client{
+		Timeout:       20 * time.Second,
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
+	resp, err := c.Do(req)
+	if err != nil {
+		t.Fatalf("探测下载地址失败：%v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusFound && resp.StatusCode != http.StatusOK {
+		t.Fatalf("下载地址返回 %d，说明资产名拼错了", resp.StatusCode)
+	}
+	t.Logf("下载地址可用（HTTP %d）", resp.StatusCode)
 }
