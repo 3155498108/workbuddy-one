@@ -412,6 +412,22 @@ function render() {
   $("#tClient").textContent = state.running ? "运行中" : "未运行";
   $("#hint").textContent = `客户端 ${state.running ? "运行中" : "未运行"} · 数据目录 profiles/ · 端口 ${state.port || ""}`;
 
+  // 端口被占而换过端口时要显眼地说清楚：API 地址变了，外部调用方得跟着改。
+  // 以前这种情况是弹一个「后台服务意外退出」然后程序直接没了，用户什么都不知道。
+  let lw = $("#listenWarn");
+  if (state.listen_note) {
+    if (!lw) {
+      lw = document.createElement("div");
+      lw.id = "listenWarn";
+      lw.className = "note";
+      document.querySelector("#view-accounts .head").after(lw);
+    }
+    lw.innerHTML = `<div>!</div><div>${escapeHtml(state.listen_note)}。` +
+      `如果别的程序在调这个 API，记得把地址里的端口改过来。</div>`;
+  } else if (lw) {
+    lw.remove();
+  }
+
   const list = $("#list");
   list.innerHTML = "";
   if (!state.accounts.length) {

@@ -20,6 +20,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -33,7 +34,7 @@ import (
 
 const (
 	appTitle   = "WorkBuddy 管家"
-	appVersion = "1.0.10"
+	appVersion = "1.0.11"
 )
 
 var browserCandidates = []string{
@@ -52,6 +53,7 @@ var (
 	browserProfile string
 	apiKey         string // 注入页面，供面板 iframe 自动登录
 	appPort        string
+	listenNote     string // 换过端口时的说明，页面顶部会提示一行
 	stopAll        context.CancelFunc
 	winBootAt      time.Time // 浏览器进程被拉起的时刻，用于启动宽限期
 	winBeatLogged  bool      // 「靠心跳救回来」只记一次日志，别每 3 秒刷一行
@@ -185,13 +187,72 @@ func ownInstance() bool {
 	return strings.Contains(string(body), `"app":"wbone"`)
 }
 
-func portFree(port string) bool {
-	ln, err := net.Listen("tcp", "127.0.0.1:"+port)
+func portFree(port string) bool { return portFreeOn("127.0.0.1", port) }
+
+// portFreeOn 试绑一个具体地址，能绑上就说明这段地址空闲。
+// host 传空串表示所有网卡（对应 config 里 ":7863" 那种写法）。
+func portFreeOn(host, port string) bool {
+	ln, err := net.Listen("tcp", net.JoinHostPort(host, port))
 	if err != nil {
 		return false
 	}
 	_ = ln.Close()
 	return true
+}
+
+// ensurePort 保证有一个能监听的端口，返回最终端口与说明（说明为空表示没动）。
+//
+// issue #1 的「后台服务意外退出」：默认端口被别的进程占着时，网关的
+// ListenAndServe 直接返回 bind 错误，主循环弹出「后台服务意外退出」就把程序关了。
+// 用户重启电脑也没用——占用者每次都比我们起得早，而且他看到的只是一个没有信息量
+// 的框，不知道该关谁。
+//
+// 现在改成：按配置试，被占就往后顺延最多 9 个端口，找到一个就换过去（并通过
+// WB2A_LISTEN 覆盖，不改用户的 config.json）。这样账号页一定能打开，用户至少
+// 能看见发生了什么、能继续切号，而不是对着一个"打不开的程序"。
+//
+// 参数是完整监听地址（config 里的 listen），为的是换端口时保留原主机部分：
+// 只改端口号，别把用户特意开放的局域网监听悄悄收回回环。
+func ensurePort(listen string) (string, string) {
+	host, port, err := net.SplitHostPort(listen)
+	if err != nil {
+		host, port = "127.0.0.1", listenPort(listen)
+	}
+	if portFreeOn(host, port) {
+		return port, ""
+	}
+	base, err := strconv.Atoi(port)
+	if err != nil || base <= 0 || base > 65526 {
+		return port, ""
+	}
+	for i := 1; i <= 9; i++ {
+		cand := strconv.Itoa(base + i)
+		if !portFreeOn(host, cand) {
+			continue
+		}
+		_ = os.Setenv("WB2A_LISTEN", net.JoinHostPort(host, cand))
+		return cand, fmt.Sprintf("端口 %s 被占用，已改用 %s（API 地址跟着变）", port, cand)
+	}
+	return port, ""
+}
+
+// explainGwErr 把网关的英文错误翻成能照着做的中文。
+func explainGwErr(err error) string {
+	msg := err.Error()
+	low := strings.ToLower(msg)
+	switch {
+	case strings.Contains(low, "only one usage of each socket address") ||
+		strings.Contains(low, "address already in use"):
+		return "端口被占用了（可能还有一份管家在后台跑）。\n" +
+			"解决办法：在任务管理器里结束所有 WorkBuddyOne.exe，再重新打开。\n\n" + msg
+	case strings.Contains(low, "load config"):
+		return "配置文件读不懂（config.json 可能被改坏了）。\n" +
+			"解决办法：把它删掉或改名，程序会重新生成一份默认配置。\n\n" + msg
+	case strings.Contains(low, "access is denied") || strings.Contains(low, "permission denied"):
+		return "没有写权限（程序目录可能是只读的，或被杀毒软件拦了）。\n" +
+			"解决办法：把程序目录换成当前用户可写的位置，或在杀软里加白名单。\n\n" + msg
+	}
+	return msg
 }
 
 func waitReady(d time.Duration) bool {
@@ -560,10 +621,13 @@ func main() {
 			return
 		}
 	}
-	if !portFree(appPort) {
-		logf("端口 %s 被占用", appPort)
-		msgBox("端口 " + appPort + " 已被其他程序占用。\n\n请关闭占用该端口的程序，或修改 config.json 里的 listen 后重试。")
-		return
+	// 端口被占不再直接退出：换一个能用的端口继续起，账号页至少能打开。
+	// 原来的行为是弹框 + return，用户只看到「后台服务意外退出」，既不知道谁占的，
+	// 也不知道该关谁，重启电脑又因为占用者先起而继续失败（issue #1）。
+	if p, note := ensurePort(cfg.Listen); note != "" {
+		appPort = p
+		listenNote = note
+		logf("%s", note)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -611,7 +675,7 @@ func main() {
 		select {
 		case err := <-gwErr:
 			logf("网关退出：%v", err)
-			msgBox("后台服务意外退出：\n" + fmt.Sprint(err))
+			msgBox("后台服务意外退出：\n" + explainGwErr(err))
 			shutdown()
 		case <-ticker.C:
 			// 优先看浏览器进程：窗口关掉 → 进程退出 → 管家跟着退，不留后台。

@@ -37,6 +37,10 @@ type stateResp struct {
 	Port     string        `json:"port"`
 	Version  string        `json:"version"`
 
+	// ListenNote 换过端口时的说明（默认端口被占用导致）。空 = 正常。
+	// 这个必须让用户看见：API 地址变了，外部调用方要跟着改，不能默默换掉。
+	ListenNote string `json:"listen_note,omitempty"`
+
 	// 对话同步：所有账号共用一份本地对话历史。
 	ShareConvs bool        `json:"share_convs"`
 	Convs      convSummary `json:"convs"`
@@ -64,6 +68,8 @@ func buildState() stateResp {
 		Port:     appPort,
 		Version:  appVersion,
 
+		ListenNote: listenNote,
+
 		ShareConvs: readPrefs().ShareConversations,
 		Convs:      scanConversations(),
 	}
@@ -86,10 +92,12 @@ func doSwitch(uid string, restart bool) (string, error) {
 	if len(snapshotsOf(uid)) == 0 {
 		return "", fmt.Errorf("这个账号没有保存过快照")
 	}
-	for _, p := range scanProducts() {
-		if p.UID == uid {
-			return "当前已经在这个账号上，无需切换", nil
-		}
+	// 用权威口径判断「是否已经在目标账号上」。以前这里遍历所有活动线路，只要
+	// 有一条指向目标账号就当成无需切换——而切号历史残留正好会让旧账号仍留在
+	// 某条线路上，于是用户点「切换到账号1」永远得到「当前已经在这个账号上」，
+	// 卡死在账号2（issue #1 的「可以切换，无法切回」）。
+	if sameAccount(uid) {
+		return "当前已经在这个账号上，无需切换", nil
 	}
 	wasRunning := clientRunning()
 	if wasRunning {

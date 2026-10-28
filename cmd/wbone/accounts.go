@@ -27,6 +27,10 @@ const authDirRel = `CodeBuddyExtension\Data\Public\auth`
 // accountSnapshotRel 客户端主账号快照：唯一能拿到明文昵称的地方。
 const accountSnapshotRel = `.workbuddy\storage\skeleton\account-snapshot.json`
 
+// primaryProduct 主客户端的登录态文件名（不含 .info）。判定「当前账号」时以它为准：
+// 客户端真正在用的就是这条线路，其它受管线路可能是历史残留或旁支。
+const primaryProduct = "workbuddy-desktop"
+
 var clientCandidates = []string{
 	`E:\WorkBuddy\WorkBuddy.exe`,
 	`C:\Program Files\WorkBuddy\WorkBuddy.exe`,
@@ -134,6 +138,36 @@ func scanProducts() []prodFile {
 	}
 	sort.SliceStable(out, func(i, j int) bool { return out[i].Product < out[j].Product })
 	return out
+}
+
+// activeLine 返回权威的「当前账号」：以主客户端线路为准，没有主线路时才退回
+// 其它受管线路（scanProducts 已按文件名排序，取第一条保证结果稳定）。
+//
+// 为什么要「权威」而不是「任一线路」：切号历史残留会让多条线路各指向不同账号。
+// 那时「任一命中」既会把两个账号都标成正在使用，也会让切换前置检查误判成
+// 「你已经在那个账号上」而直接拒绝切换——issue #1 的两个症状都来自这里。
+func activeLine() (uid, product string) {
+	var fallback prodFile
+	haveFallback := false
+	for _, p := range scanProducts() {
+		if p.Product == primaryProduct {
+			return p.UID, p.Product
+		}
+		if !haveFallback {
+			fallback, haveFallback = p, true
+		}
+	}
+	if haveFallback {
+		return fallback.UID, fallback.Product
+	}
+	return "", ""
+}
+
+// sameAccount 判断切换目标是否就是当前账号。口径必须与界面上的「正在使用」
+// 一致：目标不是权威线路上的那个，就真的切一次（顺带清掉残留线路）。
+func sameAccount(uid string) bool {
+	cur, _ := activeLine()
+	return cur != "" && cur == uid
 }
 
 func copyFileAtomic(src, dst string) error {
@@ -324,6 +358,11 @@ func accounts() []accountResp {
 		live[p.UID] = p
 		labels[p.UID] = p.label()
 	}
+	// 当前账号只认一条权威线路（见 activeLine）：早期版本切号只覆盖「目标账号
+	// 有快照的那些线路」，会在 auth 目录里留下指向旧账号的活动文件。那时这里用
+	// map[uid] 收集，任一线路命中就标 active，于是两个账号都显示「正在使用」——
+	// 前端对 active 的账号禁用按钮，用户切过去就切不回来（issue #1）。
+	currentUID, _ := activeLine()
 
 	out := []accountResp{}
 	for _, e := range entries {
@@ -368,7 +407,7 @@ func accounts() []accountResp {
 			}
 		}
 		item.ExpiresAt = msToSec(minExp)
-		if _, ok := live[uid]; ok {
+		if uid == currentUID {
 			item.Active = true
 			if item.UIN == "" {
 				item.UIN = live[uid].UIN
@@ -423,6 +462,11 @@ func switchTo(uid string) error {
 	if len(prods) == 0 {
 		return fmt.Errorf("这个账号没有保存过快照")
 	}
+	have := make(map[string]bool, len(prods))
+	for _, p := range prods {
+		have[p] = true
+	}
+
 	_ = os.MkdirAll(backupDir(), 0o755)
 	stamp := time.Now().Format("20060102-150405")
 	for _, p := range scanProducts() {
@@ -435,6 +479,28 @@ func switchTo(uid string) error {
 		if err := copyFileAtomic(snapPath(uid, prod), live); err != nil {
 			return fmt.Errorf("写入 %s 失败：%w", prod, err)
 		}
+	}
+
+	// 目标账号没有快照的受管线路：把活动文件挪进 backup，绝不能留在原地。
+	//
+	// 留着的后果就是 issue #1：auth 目录里两条线路各指向不同账号，accounts() 把
+	// 两个都标成「正在使用」，前端把两个按钮全禁掉 —— 用户切过去就切不回来，
+	// 只能去客户端手动退出登录。
+	//
+	// 为什么是挪走而不是删掉：万一那条线路用户真的在另一个客户端上用着
+	// （国内版 + 国际版并存是合法场景），删了就丢登录态；挪进 backup 还能捞回来。
+	// 代价是那个客户端会要求重新登录一次——比整个切换界面卡死好。
+	for _, p := range scanProducts() {
+		if have[p.Product] || p.UID == uid {
+			continue
+		}
+		stale := filepath.Join(backupDir(), p.Product+"-stale-"+stamp+".info")
+		if err := moveReplace(p.Path, stale); err != nil {
+			// 已经切好了，这里失败不该整体回滚；记一笔让日志能查到余下的隐患。
+			logf("切换后未能挪走线路 %s（仍指向 %s）：%v", p.Product, shortUID(p.UID), err)
+			continue
+		}
+		logf("切换后已挪走线路 %s（原指向 %s），备份在 backup/", p.Product, shortUID(p.UID))
 	}
 	return nil
 }
