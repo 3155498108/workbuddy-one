@@ -78,10 +78,17 @@ type Scheduler struct {
 	schedMu       sync.Mutex
 	rearmSchedule chan struct{}
 	rearmBalance  chan struct{}
+	// rearmTravel 旅行巡检间隔热改通知（与 rearmBalance 分开，避免两个 select 抢同一
+	// 个 channel 导致信号丢失）。
+	rearmTravel chan struct{}
 
 	// balanceInterval 余额刷新间隔（纳秒，0=暂停）。atomic 读写：执行循环每轮读当前值，
 	// SetBalanceInterval 可任意时刻热改（面板保存配置）。
 	balanceInterval atomic.Int64
+
+	// travelInterval 猫猫旅行常驻巡检间隔（纳秒，0=只走固定时点）。与 balanceInterval
+	// 同款 atomic + 独立 rearm channel（同 channel 被两个 select 消费会丢信号）。
+	travelInterval atomic.Int64
 }
 
 // New 构建。
@@ -106,6 +113,7 @@ func New(cfg Config) *Scheduler {
 		adoptTried:    make(map[string]string),
 		rearmSchedule: make(chan struct{}, 1),
 		rearmBalance:  make(chan struct{}, 1),
+		rearmTravel:   make(chan struct{}, 1),
 	}
 }
 
@@ -685,4 +693,76 @@ func (s *Scheduler) SetBalanceInterval(d time.Duration) {
 	}
 	s.balanceInterval.Store(int64(d))
 	poke(s.rearmBalance)
+}
+
+// StartTravelAuto 后台周期性猫猫旅行巡检（独立 ticker goroutine，ctx 取消即停）。
+// interval<=0 不启动（schedule.travel_auto=false 时 main 不调用即可）。
+//
+// 与固定时点（TravelHours）互补而不是替代：固定时点负责「每天必跑一趟」，
+// 巡检负责把「到了没人领 / 领完没人派」的空档填掉。单趟语义见 travelOne（幂等）。
+// 启动即先跑一趟：进程刚起时猫可能正卡在 arrived（上一次关窗口前到站的），
+// 用户期望打开就有动作，而不是干等一个间隔。
+func (s *Scheduler) StartTravelAuto(ctx context.Context, interval time.Duration) {
+	if interval <= 0 {
+		return
+	}
+	s.travelInterval.Store(int64(interval))
+	go func() {
+		var logged time.Duration
+		first := true
+		for {
+			cur := time.Duration(s.travelInterval.Load())
+			if cur != logged {
+				log.Printf("scheduler: 猫猫旅行巡检每 %s（0s = 只走固定时点）", cur)
+				logged = cur
+			}
+			if cur <= 0 {
+				select {
+				case <-ctx.Done():
+					return
+				case <-s.rearmTravel:
+					continue
+				}
+			}
+			if first {
+				// 启动即补一趟：上一进程留下的 arrived/idle 状态在这里收口。
+				first = false
+			} else {
+				timer := time.NewTimer(cur)
+				select {
+				case <-ctx.Done():
+					timer.Stop()
+					return
+				case <-s.rearmTravel:
+					timer.Stop() // 间隔已变：立刻按新值重算
+					continue
+				case <-timer.C:
+				}
+			}
+			s.RunTravelNow()
+		}
+	}()
+}
+
+// SetTravelAutoInterval 热改旅行巡检间隔；<=0 表示停止周期巡检（只留固定时点）。
+func (s *Scheduler) SetTravelAutoInterval(d time.Duration) {
+	if d < 0 {
+		d = 0
+	}
+	s.travelInterval.Store(int64(d))
+	poke(s.rearmTravel)
+}
+
+// TravelAutoInterval 当前巡检间隔（面板展示用；0 = 只走固定时点）。
+func (s *Scheduler) TravelAutoInterval() time.Duration {
+	return time.Duration(s.travelInterval.Load())
+}
+
+// TravelHours 猫猫旅行的固定时点（面板展示用；返回副本，调用方改动不影响排程）。
+func (s *Scheduler) TravelHours() []int {
+	s.schedMu.Lock()
+	defer s.schedMu.Unlock()
+	out := make([]int, len(s.cfg.TravelHours))
+	copy(out, s.cfg.TravelHours)
+	return out
 }

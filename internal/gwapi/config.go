@@ -106,6 +106,19 @@ type Config struct {
 		// 解冻语义同签到（余额 > 0 的冷却账号自动解冻），但不做签到不刷 token。
 		BalanceRefreshEnabled bool `json:"balance_refresh_enabled"` // 缺省 true；false = 关闭
 		BalanceRefreshMinutes int  `json:"balance_refresh_minutes"` // 缺省 5；<=0 回落 5
+
+		// 猫猫旅行常驻巡检（缺省 true）：按 TravelAutoMinutes 周期跑一趟「单趟状态机」。
+		//
+		// 为什么固定时点不够：一次巡检每个账号只做一个动作（到站→领奖 / 空闲→派出），
+		// 领完奖的猫要等到**下一个**时点才会再被派出去。默认时点 [9,21] 意味着 21 点
+		// 领完奖的猫要空等 12 小时，9 点派出的猫 12 点到站后要等到 21 点才领奖——
+		// 用户看到的就是「猫明明在却一直没出门」。固定时点只解决「每天跑一次」，
+		// 解决不了「空档」，所以再加一条按分钟走的常驻巡检把空档填掉。
+		//
+		// 只做 growth 域纯 RPC（状态/派出/领奖），不发模型对话，与「让位防风控」不冲突；
+		// 关掉它的方式：travel_auto=false（此时退回只有固定时点的老行为）。
+		TravelAutoEnabled bool `json:"travel_auto"`         // 缺省 true；false = 只走固定时点
+		TravelAutoMinutes int  `json:"travel_auto_minutes"` // 缺省 60；<=0 回落 60
 	} `json:"schedule"`
 
 	Global struct {
@@ -223,6 +236,8 @@ type Config struct {
 	SessionTTL             time.Duration `json:"-"`
 	SessionGCInterval      time.Duration `json:"-"`
 	BalanceRefreshInterval time.Duration `json:"-"` // 0 = 不启动（enabled=false）
+	// TravelAutoInterval 猫猫旅行常驻巡检间隔（json:"-"）；0 = 只走固定时点。
+	TravelAutoInterval time.Duration `json:"-"`
 	ExpiringSoonDur        time.Duration `json:"-"`
 	// CostExploreIntervalDur 解析后的 costTier 探索窗口（issue #136）；0 = 关停。
 	CostExploreIntervalDur time.Duration `json:"-"`
@@ -264,6 +279,8 @@ func Default() *Config {
 	c.Schedule.BlackcatEnabled = true
 	c.Schedule.BalanceRefreshEnabled = true
 	c.Schedule.BalanceRefreshMinutes = 5
+	c.Schedule.TravelAutoEnabled = true
+	c.Schedule.TravelAutoMinutes = 60
 	c.Upstream.TimeoutSeconds = 120
 	// HeaderTimeoutSeconds/IdleTimeoutSeconds 默认 0（未设置态），回落见 normalize()。
 	c.Upstream.HeaderTimeoutSeconds = 0
@@ -590,6 +607,14 @@ func (c *Config) normalize() error {
 			c.Schedule.BalanceRefreshMinutes = 5
 		}
 		c.BalanceRefreshInterval = time.Duration(c.Schedule.BalanceRefreshMinutes) * time.Minute
+	}
+	// 猫猫旅行常驻巡检：同款口径。travel_enabled=false 时整条旅行排程都停了，
+	// 巡检自然也不该起（否则「完全停猫猫旅行」会被巡检偷偷推翻）。
+	if c.Schedule.TravelEnabled && c.Schedule.TravelAutoEnabled {
+		if c.Schedule.TravelAutoMinutes <= 0 {
+			c.Schedule.TravelAutoMinutes = 60
+		}
+		c.TravelAutoInterval = time.Duration(c.Schedule.TravelAutoMinutes) * time.Minute
 	}
 	if err := c.validateScheduleHours(); err != nil {
 		return err

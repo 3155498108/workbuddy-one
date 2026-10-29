@@ -22,6 +22,10 @@ type travelStub struct {
 	state       string // /travel/status 的 data 原文
 	firstStatus int    // /buddy/first 的 HTTP 状态码（非 0 时按业务错误返回）
 
+	// stateAfterClaim 领奖之后再查状态时返回的 data 原文（空 = 复用 state）。
+	// 用于验证「领完奖立刻再派一趟」这条链：真实上游 claim 后状态会变 idle。
+	stateAfterClaim string
+
 	infoCalls, statusCalls, departCalls atomic.Int32
 	claimCalls, firstCalls, agreeCalls  atomic.Int32
 	location, record                    atomic.Int64
@@ -35,7 +39,12 @@ func (s *travelStub) handler() http.Handler {
 			fmt.Fprintf(w, `{"code":0,"msg":"ok","data":{"buddy":%s}}`, s.buddy)
 		case "/activity/growth/buddy/travel/status":
 			s.statusCalls.Add(1)
-			fmt.Fprintf(w, `{"code":0,"msg":"ok","data":%s}`, s.state)
+			st := s.state
+			// 领奖后的第二次查询：真实上游此时已回到 idle，可用于验证「领完立刻再派」。
+			if s.claimCalls.Load() > 0 && s.stateAfterClaim != "" {
+				st = s.stateAfterClaim
+			}
+			fmt.Fprintf(w, `{"code":0,"msg":"ok","data":%s}`, st)
 		case "/activity/growth/buddy/travel/depart":
 			s.departCalls.Add(1)
 			var body struct {
@@ -201,8 +210,10 @@ func TestRunTravelStateMachine(t *testing.T) {
 		wantAgree    int32
 		wantLocation int64
 		wantRecord   int64
-	}{
-		{
+		// stateAfterClaim 只在「arrived 领奖后」这一档有意义（见 travelStub 注释）：
+		// 空 = 领奖后再查仍是原状态。
+		stateAfterClaim string
+	}{		{
 			name: "无猫-领养成功", buddy: "null",
 			wantInfo: 1, wantFirst: 1, wantAgree: 1,
 		},
@@ -228,7 +239,22 @@ func TestRunTravelStateMachine(t *testing.T) {
 		{
 			name: "有猫-arrived-领奖", buddy: buddyPresent,
 			state:    `{"state":"arrived","record_id":42,"reward_credit":9}`,
-			wantInfo: 1, wantStatus: 1, wantClaim: 1, wantRecord: 42,
+			// status 两次：领奖前查状态 + 领奖后确认能否补派（stateAfterClaim 空 →
+			// 仍返回 arrived，不满足 idle 条件，因此不补派）。
+			wantInfo: 1, wantStatus: 2, wantClaim: 1, wantRecord: 42,
+		},
+		{
+			name: "有猫-arrived-领奖后立刻再派出", buddy: buddyPresent,
+			state:           `{"state":"arrived","record_id":42,"reward_credit":9}`,
+			stateAfterClaim: `{"state":"idle","daily_limit_reached":false}`,
+			wantInfo:        1, wantStatus: 2, wantClaim: 1, wantRecord: 42,
+			wantDepart: 1, wantLocation: 4,
+		},
+		{
+			name: "有猫-arrived-领奖后当日已派满-不补派", buddy: buddyPresent,
+			state:           `{"state":"arrived","record_id":42,"reward_credit":9}`,
+			stateAfterClaim: `{"state":"idle","daily_limit_reached":true}`,
+			wantInfo:        1, wantStatus: 2, wantClaim: 1, wantRecord: 42,
 		},
 		{
 			name: "有猫-arrived-缺record_id-跳过领奖", buddy: buddyPresent,
@@ -245,7 +271,7 @@ func TestRunTravelStateMachine(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			fastTravel(t)
-			stub := &travelStub{buddy: tc.buddy, state: tc.state, firstStatus: tc.firstStatus}
+			stub := &travelStub{buddy: tc.buddy, state: tc.state, firstStatus: tc.firstStatus, stateAfterClaim: tc.stateAfterClaim}
 			srv := stub.server()
 			defer srv.Close()
 
@@ -490,5 +516,77 @@ func TestTravelDayAlignsCST(t *testing.T) {
 		if got := travelDay(c.in); got != c.want {
 			t.Errorf("%s: travelDay=%s want %s", c.name, got, c.want)
 		}
+	}
+}
+
+// waitTravelCalls 轮询等待某计数器达到期望值（巡检是 goroutine，不能靠固定 sleep）。
+func waitTravelCalls(t *testing.T, name string, c *atomic.Int32, want int32) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if c.Load() >= want {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("%s calls=%d want >=%d（超时）", name, c.Load(), want)
+}
+
+// TestStartTravelAutoRunsOnStartThenRepeats 常驻巡检：启动即补一趟（把上一进程
+// 留下的 arrived/idle 收口），之后按间隔重复；间隔热改 0 后停止（只留固定时点）。
+func TestStartTravelAutoRunsOnStartThenRepeats(t *testing.T) {
+	fastTravel(t)
+	stub := &travelStub{buddy: "null"}
+	srv := stub.server()
+	defer srv.Close()
+
+	s, _ := newTravelScheduler(t, srv, "u1")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s.StartTravelAuto(ctx, 40*time.Millisecond)
+
+	waitTravelCalls(t, "info(启动即跑)", &stub.infoCalls, 1)
+	waitTravelCalls(t, "info(周期重复)", &stub.infoCalls, 3)
+
+	// 热改 0：停止周期巡检。先等在途那一趟跑完再取基准，避免把在途算成"没停"。
+	s.SetTravelAutoInterval(0)
+	time.Sleep(60 * time.Millisecond)
+	base := stub.infoCalls.Load()
+	time.Sleep(150 * time.Millisecond)
+	if got := stub.infoCalls.Load(); got != base {
+		t.Errorf("间隔改 0 后仍在巡检：%d → %d", base, got)
+	}
+	if s.TravelAutoInterval() != 0 {
+		t.Errorf("TravelAutoInterval()=%v want 0", s.TravelAutoInterval())
+	}
+}
+
+// TestStartTravelAutoDisabled interval<=0 不启动（travel_auto=false 的装配口径）。
+func TestStartTravelAutoDisabled(t *testing.T) {
+	fastTravel(t)
+	stub := &travelStub{buddy: "null"}
+	srv := stub.server()
+	defer srv.Close()
+
+	s, _ := newTravelScheduler(t, srv, "u1")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s.StartTravelAuto(ctx, 0)
+	time.Sleep(80 * time.Millisecond)
+	if n := stub.infoCalls.Load(); n != 0 {
+		t.Errorf("interval=0 不应启动巡检，info calls=%d", n)
+	}
+}
+
+// TestTravelHoursSnapshot 面板展示用的固定时点必须是副本（调用方改动不影响排程）。
+func TestTravelHoursSnapshot(t *testing.T) {
+	s := New(Config{TravelHours: []int{9, 21}})
+	got := s.TravelHours()
+	if len(got) != 2 || got[0] != 9 || got[1] != 21 {
+		t.Fatalf("TravelHours=%v want [9 21]", got)
+	}
+	got[0] = 99
+	if again := s.TravelHours(); again[0] != 9 {
+		t.Errorf("返回值被写穿到配置：%v", again)
 	}
 }

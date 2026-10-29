@@ -110,6 +110,19 @@ body {
 .qdot.wait { background: none; border: 1.5px solid var(--ink-3); }
 .qdot.err { background: var(--bad); }
 .qdot.skip { background: var(--ink-3); }
+/* 猫猫旅行（任务中心顶部）：一行一账号，状态用与队列同款圆点，视觉一致。 */
+.trav-list { padding: 2px 0 6px; }
+.trow {
+  display: grid; grid-template-columns: minmax(120px, 170px) 1fr 108px minmax(110px, 220px);
+  gap: 10px; align-items: center; padding: 8px 16px; font-size: 13px;
+}
+.trow:hover { background: var(--surface-2); }
+.trow .who { display: flex; align-items: center; gap: 7px; min-width: 0; }
+.trow .who .nm { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.trow .cat { color: var(--ink-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.trow .st { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+.trow .msg { font-size: 12px; color: var(--ink-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.trow .msg.bad { color: var(--bad); }
 @keyframes qpulse { 50% { opacity: .35; } }
 @media (prefers-reduced-motion: reduce) { .qdot.run { animation: none; } }
 .srow { display: grid; grid-template-columns: minmax(150px, 210px) 1fr auto; gap: 14px; align-items: center; padding: 13px 16px; }
@@ -706,6 +719,15 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
     <section class="view" id="view-taskscenter" hidden>
       <div class="box">
         <header>
+          <h3>猫猫旅行 <span class="hint" id="travSummary">读取中…</span></h3>
+          <span class="grow"></span>
+          <button class="xs" id="btnTravRefresh">刷新状态</button>
+          <button class="xs primary" id="btnTravRun" title="立刻对全部账号跑一趟：到站领奖 / 在家出发 / 领完立刻再派">立刻巡检</button>
+        </header>
+        <div class="trav-list" id="travList"></div>
+      </div>
+      <div class="box">
+        <header>
           <h3>成长任务队列 <span class="hint" id="qcSummary"></span></h3>
           <span class="grow"></span>
           <button class="xs" id="btnSchoolVouchers" title="开学季抽奖抽中的第三方券码（活动已结束，历史券码仍可查）">查询券码</button>
@@ -938,6 +960,11 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
                 <label class="fld"><span class="lb">旅行时点（小时，逗号分隔）</span>
                   <input name="travel_hours" placeholder="9, 21">
                   <span class="hint">一趟派出 + 一趟领奖闭环</span></label>
+                <div class="switch"><span class="lb">常驻巡检（推荐开）</span>
+                  <input type="checkbox" name="travel_auto"></div>
+                <label class="fld"><span class="lb">巡检间隔（分钟）</span>
+                  <input name="travel_auto_minutes" type="number" min="1" placeholder="60">
+                  <span class="hint">按分钟巡检：到站就领奖、领完立刻再派出，不用干等固定时点</span></label>
               </div>
               <div>
                 <div class="switch"><span class="lb">活跃上报</span>

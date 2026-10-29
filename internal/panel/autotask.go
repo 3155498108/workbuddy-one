@@ -1120,23 +1120,62 @@ func useOneExpert(p *Panel, a *auth.Auth, e upstream.MarketExpert) error {
 // runValorant 完成 WorkBuddy_Valorant：体验「无畏契约拼豆专家」（活动任务，11-15 截止）。
 //
 // 判据与 expert_5 同属 expert_actual_use，只是限定了具体专家，所以直接复用单专家链路。
-// 这个专家 2026-10-20 才上架，不硬编码 id——按中文名在实时市场列表里找，
-// 否则 id 变了或者作者改名就静默失配。
+//
+// 找专家的方式必须是**关键字搜索**，不能扫推荐列表：MarketExpertList 只取 reco_rank
+// 前 20 条，而这个专家 2026-10-20 上架时排在前面、活动过了推广期就掉出去了——实测
+// 2026-10-30 推荐前 20 里已经没有「无畏契约」，只有 keyword 搜索还能搜到
+// （ex_xQHHD1u5Jkua 排第一）。此前用推荐列表按名字扫，于是任务一到期就报
+// 「市场列表（20 条）里没找到」，用户看到的就是「这个任务做不了」。
 func runValorant(p *Panel, a *auth.Auth) (string, error) {
-	experts, err := p.cfg.Upstream.MarketExpertList(a, "agent")
-	if err != nil {
-		return "", fmt.Errorf("拉取专家列表: %w", err)
-	}
-	for _, e := range experts {
-		if !strings.Contains(e.DisplayNameZH, "无畏契约") && !strings.Contains(e.ProfessionZH, "无畏契约") {
+	// 由精确到宽的两级关键字：先按完整专家名，再按产品名（专家改名也能命中）。
+	for _, kw := range []string{"无畏契约拼豆专家", "无畏契约"} {
+		e, err := p.findExpertByKeyword(a, kw)
+		if err != nil {
+			log.Printf("panel: 无畏契约关键字「%s」搜索失败: %v", kw, err)
 			continue
 		}
-		if err := useOneExpert(p, a, e); err != nil {
+		if e == nil {
+			continue
+		}
+		if err := useOneExpert(p, a, *e); err != nil {
 			return "", fmt.Errorf("%s：%w", e.DisplayNameZH, err)
 		}
 		return "已召唤「" + e.DisplayNameZH + "」并完成一次对话", nil
 	}
-	return "", fmt.Errorf("市场列表（%d 条）里没找到「无畏契约拼豆专家」", len(experts))
+	return "", fmt.Errorf("按关键字「无畏契约」也没搜到拼豆专家（可能已下架；活动任务结束后该条会自行消失）")
+}
+
+// findExpertByKeyword 按关键字定位一个真实专家（expert_actual_use 要求 id 真实存在）。
+//
+// 顺序：市场搜索（权威，对应客户端搜索框）→ 推荐列表兜底（搜索接口异常时）。
+// 搜索命中的判定优先「名字/职业含关键字」，全不匹配时才退回搜索首条——上游搜索
+// 按相关度排序，首条基本就是目标，但前面那步能挡住「搜出一堆同名系列」的情况。
+func (p *Panel) findExpertByKeyword(a *auth.Auth, keyword string) (*upstream.MarketExpert, error) {
+	found, err := p.cfg.Upstream.MarketExpertSearch(a, keyword, "")
+	if err == nil {
+		for i := range found {
+			if strings.Contains(found[i].DisplayNameZH, keyword) || strings.Contains(found[i].ProfessionZH, keyword) {
+				return &found[i], nil
+			}
+		}
+		if len(found) > 0 {
+			return &found[0], nil
+		}
+	}
+	// 搜索失败或零命中：退回推荐列表按名字扫（老路径，排在前面时仍有效）。
+	list, lerr := p.cfg.Upstream.MarketExpertList(a, "agent")
+	for i := range list {
+		if strings.Contains(list[i].DisplayNameZH, keyword) || strings.Contains(list[i].ProfessionZH, keyword) {
+			return &list[i], nil
+		}
+	}
+	if err != nil {
+		return nil, err
+	}
+	if lerr != nil {
+		return nil, lerr
+	}
+	return nil, nil
 }
 
 // ---------------------------------------------------------------------------

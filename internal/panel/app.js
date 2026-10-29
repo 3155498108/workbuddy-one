@@ -363,7 +363,7 @@ function go(v) {
   // 到期提醒卡片：默认可见，进页面即用 overview 快照渲染（零上游请求，随首页统计
   // 每轮刷新）。不再「打开账号池就打上游」——逐账号实时查在账号多时会卡死面板。
   // 完整逐包明细由卡片上的「检查」按钮显式触发（loadPackages/loadExpiry）。
-  if (v === 'taskscenter') reattachQueueView();
+  if (v === 'taskscenter') { reattachQueueView(); loadTravelStatus(true); }
 }
 document.querySelectorAll('.nav a').forEach(a => a.onclick = e => { e.preventDefault(); go(a.dataset.view); history.replaceState(null, '', '#' + a.dataset.view); });
 /* 首次进入延到本轮脚本求值之后再 go()。
@@ -990,6 +990,7 @@ const CFG_MAP = {
   package_detail_limit: ['panel', 'package_detail_limit'],
   checkin_hours: ['schedule', 'checkin_hours'], checkin_enabled: ['schedule', 'checkin_enabled'], growth_hours: ['schedule', 'growth_hours'], growth_enabled: ['schedule', 'growth_enabled'],
   travel_hours: ['schedule', 'travel_hours'], travel_enabled: ['schedule', 'travel_enabled'],
+  travel_auto: ['schedule', 'travel_auto'], travel_auto_minutes: ['schedule', 'travel_auto_minutes'],
   activity_hours: ['schedule', 'activity_hours'], activity_enabled: ['schedule', 'activity_enabled'],
   keepalive_hours: ['schedule', 'keepalive_hours'], keepalive_enabled: ['schedule', 'keepalive_enabled'],
   balance_refresh_enabled: ['schedule', 'balance_refresh_enabled'], balance_refresh_minutes: ['schedule', 'balance_refresh_minutes'],
@@ -1670,6 +1671,64 @@ async function loadSchoolVouchers() {
 $('btnSchoolVouchers').onclick = loadSchoolVouchers;
 $('btnVcClose').onclick = () => $('vcVeil').classList.remove('on');
 $('btnVcRefresh').onclick = loadSchoolVouchers;
+
+/* ── 猫猫旅行（任务中心顶部）─────────────────────────────────────────
+   状态从后端一次拿齐（每账号两次上游 GET，只读）；派出/领奖动作仍由调度器
+   （固定时点 + 常驻巡检）或「立刻巡检」触发，本页只负责看清「猫在哪」。 */
+const TRAV_STATES = {
+  idle: ['在家待发', 'wait'],
+  traveling: ['旅途中', 'run'],
+  arrived: ['已到站，待领奖', 'done'],
+};
+function travRowHTML(it) {
+  const [word, dot] = TRAV_STATES[it.state] || ['—', 'skip'];
+  const cat = it.has_cat ? it.cat_name : (it.error ? '—' : '未领养');
+  let msg = '';
+  if (it.error) msg = '<span class="msg bad" title="' + esc(it.error) + '">' + esc(it.error) + '</span>';
+  else if (it.state === 'arrived') msg = '<span class="msg">可领 ' + (it.reward_credit || 0) + ' 分，巡检会自动领</span>';
+  else if (it.state === 'traveling') {
+    const left = it.arrive_at ? Math.max(0, Math.round((it.arrive_at * 1000 - Date.now()) / 60000)) : 0;
+    msg = '<span class="msg">' + (left ? left + ' 分钟后到站' : '即将到站') + (it.reward_credit ? ' · 预计 ' + it.reward_credit + ' 分' : '') + '</span>';
+  } else if (it.daily_limit_reached) msg = '<span class="msg">今日已派过一趟</span>';
+  else msg = '<span class="msg">下次巡检验到就会派出去</span>';
+  return '<div class="trow">' +
+    '<span class="who"><span class="nm">' + esc(it.nickname || it.uid.slice(0, 12)) + '</span></span>' +
+    '<span class="cat">' + esc(cat || '') + '</span>' +
+    '<span class="st"><span class="qdot ' + dot + '"></span>' + word + '</span>' +
+    msg +
+    '</div>';
+}
+async function loadTravelStatus(silent) {
+  const box = $('travList');
+  try {
+    const d = await api('travel/status');
+    const rows = d.accounts || [];
+    const autoMin = d.auto_minutes || 0;
+    const hours = (d.hours || []).join('、');
+    $('travSummary').textContent = autoMin > 0
+      ? '自动：每 ' + autoMin + ' 分钟巡检' + (hours ? ' + 固定 ' + hours + ' 点' : '')
+      : '仅固定时点' + (hours ? '（' + hours + ' 点）' : '（未启用）');
+    if (!rows.length) {
+      box.innerHTML = '<div class="tc-empty"><div class="t">没有可用账号</div><div class="d">在账号页添加账号后，巡检会自动领养并把猫派出去。</div></div>';
+      return;
+    }
+    box.innerHTML = rows.map(travRowHTML).join('');
+  } catch (e) {
+    if (!silent) toast(e.message, 'err');
+    box.innerHTML = '<div class="trow"><span class="who"></span><span class="cat"></span><span class="st"></span><span class="msg bad">' + esc(e.message) + '</span></div>';
+  }
+}
+$('btnTravRefresh').onclick = () => loadTravelStatus();
+$('btnTravRun').onclick = async () => {
+  const b = $('btnTravRun');
+  b.disabled = true; b.textContent = '巡检中…';
+  try {
+    await api('travel_all', { method: 'POST' });
+    toast('已开始巡检（到站领奖 → 领完立刻再派），几秒后刷新', 'ok');
+    setTimeout(() => loadTravelStatus(true), 6000);
+  } catch (e) { toast(e.message, 'err'); }
+  finally { b.disabled = false; b.textContent = '立刻巡检'; }
+};
 
 /* 成长任务队列。lastQueueSeq 记录本页启动过的队列代次：执行结束后的残留 items
    （running=false 但 seq 停在旧值）不再回写视图——否则扫描结果 3 秒后被上一轮

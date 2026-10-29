@@ -88,7 +88,13 @@ func (s *Scheduler) travelOne(a *auth.Auth) {
 	}
 	switch ts.State {
 	case travelStateArrived:
-		s.travelClaim(a, ts)
+		if !s.travelClaim(a, ts) {
+			return
+		}
+		// 领完奖的猫默认要等到**下一个**固定时点才会再被派出去（9 点派出 → 12 点到站
+		// → 21 点才领奖并再派）。用户看到的就是「猫明明在家却一直没出门」。
+		// 这里领奖成功后立刻补一趟：当日次数还没用完就马上再派出，一趟巡检闭环。
+		s.travelDepartAgain(a)
 	case travelStateIdle:
 		s.travelDepart(a, ts)
 	case travelStateTraveling:
@@ -96,6 +102,30 @@ func (s *Scheduler) travelOne(a *auth.Auth) {
 	default:
 		log.Printf("travel %s: skip (unknown state %q)", logfmt.Label(a.UID, a.Nickname), ts.State)
 	}
+}
+
+// travelDepartAgain 领奖后立刻查询状态并补派一趟（幂等：次数用完/在途/异常都只是跳过）。
+//
+// 为什么不直接用领奖时那份 ts：claim 只回 reward_credit，回不到「现在还能不能再派」；
+// 当日上限（daily_limit_reached）是服务端按自然日算的，必须重查才准。
+func (s *Scheduler) travelDepartAgain(a *auth.Auth) {
+	ts, err := s.cfg.Upstream.TravelStatus(a)
+	if err != nil {
+		log.Printf("travel %s: re-depart status: %v", logfmt.Label(a.UID, a.Nickname), err)
+		return
+	}
+	if ts.State != travelStateIdle {
+		return // 上游已经在途（并发触发/连点）：不重复派
+	}
+	if ts.DailyLimitReached {
+		log.Printf("travel %s: re-depart skipped (daily limit reached after claim)", logfmt.Label(a.UID, a.Nickname))
+		return
+	}
+	if err := s.cfg.Upstream.TravelDepart(a, travelLocationID); err != nil {
+		log.Printf("travel %s: re-depart: %v", logfmt.Label(a.UID, a.Nickname), err)
+		return
+	}
+	log.Printf("travel %s: re-depart ok after claim location=%d", logfmt.Label(a.UID, a.Nickname), travelLocationID)
 }
 
 // travelDepart 空闲且未达当日上限时派出（每日 1 次，自然日 00:00 CST 重置）。
@@ -111,18 +141,19 @@ func (s *Scheduler) travelDepart(a *auth.Auth, ts *upstream.TravelState) {
 	log.Printf("travel %s: depart ok location=%d", logfmt.Label(a.UID, a.Nickname), travelLocationID)
 }
 
-// travelClaim 到站领奖（必须带 record_id）。
-func (s *Scheduler) travelClaim(a *auth.Auth, ts *upstream.TravelState) {
+// travelClaim 到站领奖（必须带 record_id）。返回是否领取成功（供领奖后补派判断）。
+func (s *Scheduler) travelClaim(a *auth.Auth, ts *upstream.TravelState) bool {
 	if ts.RecordID == 0 {
 		log.Printf("travel %s: claim skipped (arrived but no record_id)", logfmt.Label(a.UID, a.Nickname))
-		return
+		return false
 	}
 	reward, err := s.cfg.Upstream.TravelClaim(a, ts.RecordID)
 	if err != nil {
 		log.Printf("travel %s: claim record=%d: %v", logfmt.Label(a.UID, a.Nickname), ts.RecordID, err)
-		return
+		return false
 	}
 	log.Printf("travel %s: claim ok record=%d reward=%d", logfmt.Label(a.UID, a.Nickname), ts.RecordID, reward)
+	return true
 }
 
 // travelAdopt 无猫时领养，链路：report → agreement → buddy/first。

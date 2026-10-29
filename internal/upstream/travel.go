@@ -39,6 +39,8 @@ type TravelState struct {
 	DailyLimitReached bool   `json:"daily_limit_reached"` // 今日已派出过（自然日 00:00 CST 重置）
 	RecordID          int64  `json:"record_id"`           // 在途/到站记录 id，claim 必带
 	RewardCredit      int64  `json:"reward_credit"`       // 到站可领奖励积分
+	ArriveAt          int64  `json:"arrive_at"`           // 预计/实际到站时间（unix 秒），面板展示用
+	DurationHours     int    `json:"duration_hours"`      // 本趟时长（小时）
 }
 
 // growthJSON 发 growth 域请求并解信封；body 为 nil 时不带请求体。

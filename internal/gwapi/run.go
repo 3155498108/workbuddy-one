@@ -202,8 +202,11 @@ func Run(parent context.Context, cfgPath string, decorate func(http.Handler) htt
 	switch {
 	case !cfg.Schedule.TravelEnabled:
 		log.Printf("猫猫旅行已禁用（schedule.travel_enabled=false）")
+	case cfg.TravelAutoInterval > 0:
+		log.Printf("猫猫旅行已启用：固定时点 %v + 每 %s 巡检（领奖后立刻再派出，不留空档）",
+			cfg.Schedule.TravelHours, cfg.TravelAutoInterval)
 	default:
-		log.Printf("猫猫旅行已启用：%v 点（独立排程：领养 / 派出 / 领奖）", cfg.Schedule.TravelHours)
+		log.Printf("猫猫旅行已启用：%v 点（独立排程：领养 / 派出 / 领奖；travel_auto=false 已关常驻巡检）", cfg.Schedule.TravelHours)
 	}
 	switch {
 	case !cfg.Schedule.ActivityEnabled:
@@ -324,6 +327,9 @@ func Run(parent context.Context, cfgPath string, decorate func(http.Handler) htt
 	defer stop()
 	go sch.Run(ctx)
 	sch.StartBalanceRefresh(ctx, cfg.BalanceRefreshInterval)
+	// 猫猫旅行常驻巡检（独立 ticker，与固定时点互补）：启动即补一趟，把上一进程
+	// 留下的「到站未领 / 领完未派」收口，之后按 travel_auto_minutes 周期巡检。
+	sch.StartTravelAuto(ctx, cfg.TravelAutoInterval)
 
 	// 启动即预热模型积分倍率表：倍率只在 FetchModels/FetchGlobalModelInfos 成功时
 	// 填充（两者均懒触发），重启后到首次 /v1/models 或面板模型页被访问之前，
@@ -513,6 +519,7 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 		!newCfg.Schedule.ActivityEnabled, !newCfg.Schedule.KeepaliveEnabled, !newCfg.Schedule.BlackcatEnabled,
 		!newCfg.Schedule.GrowthEnabled)
 	sch.SetBalanceInterval(newCfg.BalanceRefreshInterval)
+	sch.SetTravelAutoInterval(newCfg.TravelAutoInterval)
 	sch.SetIncludeDisabledInTasks(newCfg.Schedule.IncludeDisabledInTasks)
 
 	return restartRequiredFields(newCfg), nil
