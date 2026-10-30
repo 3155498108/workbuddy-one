@@ -460,7 +460,9 @@ function render() {
         (a.last_refresh_at ? `\n上次续期：${fmtDate(new Date(a.last_refresh_at * 1000).toISOString())}` : "") +
         (winDays > 0 ? `\n续期窗口：${winDays} 天（每在客户端里跑一次就重算）` : "") +
         "\n\n这是 token 的硬到期时间。就算还剩很多天，只要这个号在别处（另一台电脑/手机/网页版）登录过，" +
-        "旧 token 也会被换掉——那种情况切过去仍可能要重新登录，登一次就会重新计时。";
+        "旧 token 也会被换掉——那种情况切过去仍可能要重新登录。\n\n" +
+        "判断办法：看下面「N 天前续期」。今天/1 天前 = 快照是新的，放心切；" +
+        "超过 3 天没续期 → 建议先切过去打开一次让它续期，再切回来。";
       const cls = leftMs <= 0 ? "bad" : (left <= 7 ? "warn" : "");
       const text = leftMs <= 0 ? "登录态已过期" : (left < 1 ? "登录态不足 1 天" : `登录态还剩 ${left} 天`);
       credTag = `<span class="tag ${cls}" title="${escapeHtml(tip)}">${text}</span>`;
@@ -473,13 +475,25 @@ function render() {
     const idleTxt = idleDays < 0 ? ""
       : (idleDays === 0 ? " · 今天续期" : ` · ${idleDays} 天前续期`);
 
+    // 超过 3 天没续期：到期日看着还早，但快照里那份 token 很可能已被别处顶掉，
+    // 切过去大概率要求重新登录。把处置办法直接摆在卡片上，别让人以为是坏了。
+    // 阈值与 Go 侧 credStaleDays 保持一致（TestUIStaleHint 盯住）。
+    const staleTip = `这个号已经 ${idleDays} 天没在客户端里续过期。\n\n` +
+      "refresh token 是一次性的：每次续期都会换新的、旧的立即作废。所以" +
+      "就算离到期还有几十天，别处（另一台电脑 / 手机 / 网页版）登录过就可能把它顶掉，\n" +
+      "切过去仍会要求重新登录。\n\n" +
+      "建议先切过去打开一次 WorkBuddy 让它续期（1 分钟），之后再切就顺畅了。";
+    const staleTag = idleDays >= 3
+      ? `<span class="tag warn" title="${escapeHtml(staleTip)}">${idleDays} 天未续期 · 建议先切过去打开一次</span>`
+      : "";
+
     card.innerHTML = `
       <div class="avatar">${initials(a.nickname)}</div>
       <div class="meta">
         <div class="name">
           ${escapeHtml(a.nickname)}
           ${a.active ? '<span class="tag cur">当前使用</span>' : ""}
-          ${tags}${creditTag}${stateTag}${credTag}
+          ${tags}${creditTag}${stateTag}${credTag}${staleTag}
           <button class="edit" title="重命名">改名</button>
         </div>
         <div class="id">UID ${escapeHtml(a.uid)}${a.saved_at ? " · 保存于 " + fmtDate(a.saved_at) : ""}${idleTxt}</div>

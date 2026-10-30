@@ -270,3 +270,46 @@ func TestUIUsesRoundedDays(t *testing.T) {
 		t.Error("提示语里不该写死「重新续 30 天」，窗口天数应按数据算")
 	}
 }
+
+// TestCredNoteStaleAdvice 超过 credStaleDays 天没续期时，切号提示必须带上
+// 「建议先切过去打开一次」这句处置办法——这才是用户真正需要的动作。
+func TestCredNoteStaleAdvice(t *testing.T) {
+	_, _ = setupAuthDirs(t)
+	const uid = "cccc1111-2222-3333-4444-555566667777"
+	_ = os.MkdirAll(profileDir(uid), 0o755)
+
+	// 4 天前续期、离到期还有 56 天：到期日看着安全，但 token 很可能已被顶掉。
+	writeInfo(t, snapPath(uid, "workbuddy-desktop"), uid, 60*24*time.Hour, 4*24*time.Hour)
+	note := credNote(uid)
+	if !strings.Contains(note, "建议先切过去打开一次") {
+		t.Fatalf("过期天数≥%d 时应给出「建议先切过去打开一次」，实际：%q", credStaleDays, note)
+	}
+	if !strings.Contains(note, "4 天前") {
+		t.Fatalf("应说明已 4 天没续期，实际：%q", note)
+	}
+
+	// 2 天前续期：还不到阈值，不该催（避免每天都弹同一句）。
+	writeInfo(t, snapPath(uid, "workbuddy-desktop"), uid, 60*24*time.Hour, 2*24*time.Hour)
+	if note := credNote(uid); strings.Contains(note, "建议先切过去打开一次") {
+		t.Fatalf("未达阈值不该催，实际：%q", note)
+	}
+}
+
+// TestUIStaleHint 卡片上要直接标出「N 天未续期 · 建议先切过去打开一次」，
+// 阈值与 credStaleDays 同值（3 天）。
+func TestUIStaleHint(t *testing.T) {
+	raw, err := os.ReadFile("ui.html")
+	if err != nil {
+		t.Fatalf("读 ui.html: %v", err)
+	}
+	page := string(raw)
+	if !strings.Contains(page, "建议先切过去打开一次") {
+		t.Error("卡片应直接写出「建议先切过去打开一次」")
+	}
+	if !strings.Contains(page, "idleDays >= 3") {
+		t.Errorf("卡片阈值应为 idleDays >= %d（与 credStaleDays 一致）", credStaleDays)
+	}
+	if !strings.Contains(page, "${staleTag}") {
+		t.Error("staleTag 没有插进卡片模板（写了也不会显示）")
+	}
+}

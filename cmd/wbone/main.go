@@ -34,7 +34,7 @@ import (
 
 const (
 	appTitle   = "WorkBuddy 管家"
-	appVersion = "1.0.14"
+	appVersion = "1.0.15"
 )
 
 var browserCandidates = []string{

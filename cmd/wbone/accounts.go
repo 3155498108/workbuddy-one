@@ -575,6 +575,15 @@ func credOfAccount(uid string) (lastRefresh, expires int64) {
 	return lastRefresh, expires
 }
 
+// credStaleDays 「多久没续期就要提醒先切过去跑一次」的阈值（天）。
+//
+// 为什么是 3 天：refresh token 一次性轮换，只有「在客户端里真的跑过」才会拿到新的。
+// 放了几天没动的号，快照里那份很可能已经被别处（另一台电脑 / 手机 / 网页版）的
+// 登录顶掉，切过去就会要求重新登录。到期时间是 60 天，看起来很安全，真正决定
+// 会不会掉登录的是这个「几天没续」，所以单独给一条提醒——界面（ui.html）用同一个
+// 数字，改这里要同步改那边（TestUIStaleHint 会盯住）。
+const credStaleDays = 3
+
 // credNote 给切换结果加一句登录态寿命说明。
 //
 // 为什么要在切号时就说：客户端每次续期都会换新 refresh token 并把旧的作废，
@@ -607,7 +616,14 @@ func credNote(uid string) string {
 				roundDays(d), time.UnixMilli(exp).Format("01-02"))
 		}
 	}
-	note += "；万一被要求重新登录，登一次就会重新计时）"
+	if idleDays >= credStaleDays {
+		// 到期还早，但「多久没续」才是掉登录的真因：把处置办法直接写出来。
+		note += fmt.Sprintf("。已经 %d 天没续期，直接切过去大概率要求重新登录——"+
+			"建议先切过去打开一次 WorkBuddy 让它续期（1 分钟），之后再切就顺畅了", idleDays)
+	} else {
+		note += "；万一被要求重新登录，登一次就会重新计时"
+	}
+	note += "）"
 	return note
 }
 
