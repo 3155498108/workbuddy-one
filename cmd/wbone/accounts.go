@@ -597,25 +597,39 @@ func credNote(uid string) string {
 		case d <= 0:
 			note += "，登录态已过期"
 		case d < 24*time.Hour:
-			// 不能写成「还剩 0 天」：整数除法把不足一天截成 0，读起来像没过期。
+			// 不能写成「还剩 0 天」：截断会把不足一天算成 0，读起来像没过期。
 			note += "，登录态不到 1 天了"
 		default:
-			note += fmt.Sprintf("，登录态还剩 %d 天", int(d.Hours()/24))
+			// 用四舍五入而不是截断：客户端续期窗口是整 60 天（2026-10 实测；此前是
+			// 30 天），刚续期完的号剩余是 59.999… 天，截断会显示「还剩 59 天」，
+			// 让人以为少了一天（用户实测提问过）。天数只做展示，不参与任何判断。
+			note += fmt.Sprintf("，登录态还剩 %d 天（%s 到期）",
+				roundDays(d), time.UnixMilli(exp).Format("01-02"))
 		}
 	}
 	note += "；万一被要求重新登录，登一次就会重新计时）"
 	return note
 }
 
+// roundDays 把时长换成「天数」用于展示：四舍五入；还有不到一天时给 1（不显示 0）。
+// 独立出来是为了让 credNote 与卡片（ui.html）用同一口径，避免两处一个 59 一个 60。
+func roundDays(d time.Duration) int {
+	n := int(d.Round(24*time.Hour).Hours() / 24)
+	if d > 0 && n < 1 {
+		n = 1
+	}
+	return n
+}
+
 // credWarnShort 报告该账号是否「快要（或已经）需要重新登录」。
-// 界面拿它给卡片标黄/标红，阈值取 7 天：客户端续期窗口是 30 天，
-// 7 天足够用户挑个时间切过去跑一次。
+// 界面拿它给卡片标黄/标红，阈值取 7 天：客户端续期窗口是 60 天（2026-10 实测，
+// 旧版为 30 天，这里不写死），7 天足够用户挑个时间切过去跑一次。
 func credWarnShort(uid string) (days int, known bool) {
 	_, exp := credOfAccount(uid)
 	if exp <= 0 {
 		return 0, false
 	}
-	return int(time.Until(time.UnixMilli(exp)).Hours() / 24), true
+	return roundDays(time.Until(time.UnixMilli(exp))), true
 }
 
 // syncSnapshotsSoon 在客户端刚启动并刷完 token 之后，把活动登录态同步进快照。

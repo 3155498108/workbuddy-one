@@ -445,15 +445,22 @@ function render() {
     const stateTag = pa && pa.disabled ? `<span class="tag line">面板已禁用</span>`
       : (pa && pa.cooling ? `<span class="tag line">面板冷却中</span>` : "");
 
-    // 登录态剩余寿命。客户端 refresh token 是 30 天滚动：每在客户端里跑一次
-    // 就续 30 天；超过 30 天没动过，就必须重新登录。
+    // 登录态剩余寿命。天数只读客户端写的 refreshExpiresAt（硬到期），不写死窗口：
+    // 上游 2026-10 起把续期窗口从 30 天改成了 60 天，写死会立刻过期。
+    // 天数用四舍五入：刚续期完剩余是 59.999… 天，截断会显示「还剩 59 天」，
+    // 用户会以为少了一天（实测被问过）。
     let credTag = "";
     if (a.expires_at) {
       const leftMs = a.expires_at * 1000 - Date.now();
-      const left = Math.floor(leftMs / 86400000);
+      const left = Math.round(leftMs / 86400000);
+      // 窗口长度也按数据算（到期时间 - 上次续期），不猜 30/60。
+      const winDays = a.last_refresh_at
+        ? Math.round((a.expires_at - a.last_refresh_at) / 86400) : 0;
       const tip = `refresh token 到期：${fmtDate(new Date(a.expires_at * 1000).toISOString())}` +
         (a.last_refresh_at ? `\n上次续期：${fmtDate(new Date(a.last_refresh_at * 1000).toISOString())}` : "") +
-        "\n\n这个号只要切过去把 WorkBuddy 打开一次，就会重新续 30 天。";
+        (winDays > 0 ? `\n续期窗口：${winDays} 天（每在客户端里跑一次就重算）` : "") +
+        "\n\n这是 token 的硬到期时间。就算还剩很多天，只要这个号在别处（另一台电脑/手机/网页版）登录过，" +
+        "旧 token 也会被换掉——那种情况切过去仍可能要重新登录，登一次就会重新计时。";
       const cls = leftMs <= 0 ? "bad" : (left <= 7 ? "warn" : "");
       const text = leftMs <= 0 ? "登录态已过期" : (left < 1 ? "登录态不足 1 天" : `登录态还剩 ${left} 天`);
       credTag = `<span class="tag ${cls}" title="${escapeHtml(tip)}">${text}</span>`;

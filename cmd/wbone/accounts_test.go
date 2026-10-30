@@ -225,3 +225,48 @@ func TestRealAccountsExpiry(t *testing.T) {
 			a.Nickname, left.Hours()/24, idle.Hours()/24, credNote(a.UID))
 	}
 }
+
+// TestRoundDaysNoOffByOne 剩余天数必须四舍五入，不能截断。
+//
+// 现场：用户看到「登录态还剩 59 天」问是不是算错了。实际 refreshExpiresAt 是
+// 今天 09:09 + 60 天整，剩余 59.999… 天，截断成 59。天数只做展示，但差一天会
+// 让人怀疑整块数据。
+func TestRoundDaysNoOffByOne(t *testing.T) {
+	cases := []struct {
+		name string
+		d    time.Duration
+		want int
+	}{
+		{"刚续期的 60 天窗口", 60*24*time.Hour - time.Second, 60},
+		{"59 天 23 小时", 59*24*time.Hour + 23*time.Hour, 60},
+		{"剩余 59 天 12 小时", 59*24*time.Hour + 12*time.Hour, 60},
+		{"剩余 59 天 11 小时", 59*24*time.Hour + 11*time.Hour, 59},
+		{"不足一天按 1 天", 30 * time.Minute, 1},
+		{"已过期保持负数", -time.Hour, 0},
+	}
+	for _, c := range cases {
+		if got := roundDays(c.d); got != c.want {
+			t.Errorf("%s: roundDays=%d want %d", c.name, got, c.want)
+		}
+	}
+}
+
+// TestUIUsesRoundedDays 界面那行「登录态还剩 N 天」必须与 Go 侧同口径（四舍五入）。
+// 只截断的话，刚续期完的 60 天会显示成 59——这正是用户提的那个问题。
+func TestUIUsesRoundedDays(t *testing.T) {
+	raw, err := os.ReadFile("ui.html")
+	if err != nil {
+		t.Fatalf("读 ui.html: %v", err)
+	}
+	page := string(raw)
+	if !strings.Contains(page, "Math.round(leftMs / 86400000)") {
+		t.Error("卡片剩余天数应使用 Math.round(leftMs / 86400000)（截断会少一天）")
+	}
+	if strings.Contains(page, "Math.floor(leftMs / 86400000)") {
+		t.Error("卡片剩余天数不应使用 Math.floor（59.99 天会显示成 59）")
+	}
+	// 窗口长度不能写死 30 天：上游 2026-10 起改成 60 天。
+	if strings.Contains(page, "重新续 30 天") {
+		t.Error("提示语里不该写死「重新续 30 天」，窗口天数应按数据算")
+	}
+}
