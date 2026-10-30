@@ -709,7 +709,6 @@ func (s *Scheduler) StartTravelAuto(ctx context.Context, interval time.Duration)
 	s.travelInterval.Store(int64(interval))
 	go func() {
 		var logged time.Duration
-		first := true
 		for {
 			cur := time.Duration(s.travelInterval.Load())
 			if cur != logged {
@@ -724,22 +723,27 @@ func (s *Scheduler) StartTravelAuto(ctx context.Context, interval time.Duration)
 					continue
 				}
 			}
-			if first {
-				// 启动即补一趟：上一进程留下的 arrived/idle 状态在这里收口。
-				first = false
-			} else {
-				timer := time.NewTimer(cur)
-				select {
-				case <-ctx.Done():
-					timer.Stop()
-					return
-				case <-s.rearmTravel:
-					timer.Stop() // 间隔已变：立刻按新值重算
-					continue
-				case <-timer.C:
+			// 先跑再等：启动即补一趟，把上一进程留下的 arrived/idle 收口。
+			total, failed := s.RunTravelNowReport()
+			wait := cur
+			if total > 0 && failed > 0 {
+				// 这一趟有账号没跑成（断网 / 上游 5xx / 代理没起）。干等一个完整间隔意味着
+				// 「今天唯一的一次派出」可能被推到下一个整点甚至下一个时点，所以退避重试。
+				// 只退到 travelRetryDelay，不改用户配的间隔。
+				if travelRetryDelay < wait {
+					wait = travelRetryDelay
 				}
+				log.Printf("scheduler: 猫猫旅行巡检 %d/%d 个账号失败，%s 后重试", failed, total, wait)
 			}
-			s.RunTravelNow()
+			timer := time.NewTimer(wait)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return
+			case <-s.rearmTravel:
+				timer.Stop() // 间隔已改：立刻按新值重算
+			case <-timer.C:
+			}
 		}
 	}()
 }

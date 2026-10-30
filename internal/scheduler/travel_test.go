@@ -26,6 +26,9 @@ type travelStub struct {
 	// 用于验证「领完奖立刻再派一趟」这条链：真实上游 claim 后状态会变 idle。
 	stateAfterClaim string
 
+	// infoStatus 非 0 时 /buddy/info 直接返回该 HTTP 状态（模拟断网/上游 5xx）。
+	infoStatus int
+
 	infoCalls, statusCalls, departCalls atomic.Int32
 	claimCalls, firstCalls, agreeCalls  atomic.Int32
 	location, record                    atomic.Int64
@@ -36,6 +39,11 @@ func (s *travelStub) handler() http.Handler {
 		switch r.URL.Path {
 		case "/activity/growth/buddy/info":
 			s.infoCalls.Add(1)
+			if s.infoStatus >= 400 {
+				w.WriteHeader(s.infoStatus)
+				w.Write([]byte(`{"code":500,"msg":"boom"}`))
+				return
+			}
 			fmt.Fprintf(w, `{"code":0,"msg":"ok","data":{"buddy":%s}}`, s.buddy)
 		case "/activity/growth/buddy/travel/status":
 			s.statusCalls.Add(1)
@@ -249,6 +257,13 @@ func TestRunTravelStateMachine(t *testing.T) {
 			stateAfterClaim: `{"state":"idle","daily_limit_reached":false}`,
 			wantInfo:        1, wantStatus: 2, wantClaim: 1, wantRecord: 42,
 			wantDepart: 1, wantLocation: 4,
+		},
+		{
+			// 领奖前就已经 daily_limit_reached=true（今天早就派过）→ 必然补派不了，
+			// 直接跳过、不再多打一次 status（省一次上游请求，也不产生误导性日志）。
+			name: "有猫-arrived-领奖前当日已派满-不重查", buddy: buddyPresent,
+			state:    `{"state":"arrived","record_id":42,"reward_credit":9,"daily_limit_reached":true}`,
+			wantInfo: 1, wantStatus: 1, wantClaim: 1, wantRecord: 42,
 		},
 		{
 			name: "有猫-arrived-领奖后当日已派满-不补派", buddy: buddyPresent,
@@ -588,5 +603,42 @@ func TestTravelHoursSnapshot(t *testing.T) {
 	got[0] = 99
 	if again := s.TravelHours(); again[0] != 9 {
 		t.Errorf("返回值被写穿到配置：%v", again)
+	}
+}
+
+// TestTravelAutoRetriesSoonAfterFailure 整趟失败（断网/上游 5xx）时不能干等一个
+// 完整间隔：猫猫旅行一天只有一次派出机会，等 60 分钟会把这一次推很远。
+func TestTravelAutoRetriesSoonAfterFailure(t *testing.T) {
+	fastTravel(t)
+	oldRetry := travelRetryDelay
+	travelRetryDelay = 30 * time.Millisecond
+	t.Cleanup(func() { travelRetryDelay = oldRetry })
+
+	stub := &travelStub{buddy: "null", infoStatus: 500}
+	srv := stub.server()
+	defer srv.Close()
+
+	s, _ := newTravelScheduler(t, srv, "u1")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	// 间隔 10 秒：若没有短退避，300ms 内最多只会有 1 次调用。
+	s.StartTravelAuto(ctx, 10*time.Second)
+
+	waitTravelCalls(t, "info(失败重试)", &stub.infoCalls, 3)
+	if got := s.TravelAutoInterval(); got != 10*time.Second {
+		t.Errorf("TravelAutoInterval=%v want 10s（短退避不能改掉用户配的间隔）", got)
+	}
+}
+
+// TestRunTravelNowReportCountsOnlyRealFailures 只有真错误算失败；skip 不算。
+func TestRunTravelNowReportCountsOnlyRealFailures(t *testing.T) {
+	fastTravel(t)
+	// 在途 = skip，应为 0 失败。
+	stub := &travelStub{buddy: `{"id":7,"name":"档案喵"}`, state: `{"state":"traveling","record_id":42}`}
+	srv := stub.server()
+	defer srv.Close()
+	s, _ := newTravelScheduler(t, srv, "u1")
+	if total, failed := s.RunTravelNowReport(); total != 1 || failed != 0 {
+		t.Errorf("traveling: total=%d failed=%d want 1/0", total, failed)
 	}
 }
