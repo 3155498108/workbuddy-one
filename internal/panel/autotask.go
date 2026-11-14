@@ -14,6 +14,8 @@
 //   - expert_5 / Expert_team_use_3：真实专家列表 + 召唤链 + 真实 chat（服务端 requestId）
 //   - expert_actual_use（三账号实测）
 //   - Hp_Appearance：appearance/set + appearance_skin_apply 事件（两账号实测）
+//   - skill_share（分享技能给好友，11-18 截止）：skill_share_channel_action 事件
+//     （两账号实测：单发即点亮，无需真实分享码）
 //
 // 仍未破解：skill_1（疑似要求真实 Skill 工具调用）。
 // 不做：Expert_lighthouse（需真实连接器授权）、Expert_Philanthropy（真实捐款）。
@@ -128,6 +130,11 @@ var autoActions = []autoAction{
 		TaskCode: "skill_1",
 		Desc:     "真实对话 + skill_info 技能加载事件（已验证：人杰2 点亮）",
 		run:      runSkillFresh,
+	},
+	{
+		TaskCode: "skill_share",
+		Desc:     "上报技能详情+分享事件（skill_share_channel_action，已验证：两账号点亮）",
+		run:      runSkillShare,
 	},
 	{
 		TaskCode: "Expert_lighthouse",
@@ -945,8 +952,44 @@ func runSkillFresh(p *Panel, a *auth.Auth) (string, error) {
 	return "已上报真实对话 + skill_info 技能加载事件", nil
 }
 
-// runExpertLighthouse 完成 Expert_lighthouse（体验「腾讯轻量云」专家）。
-// 2026-09-12 判据（真实样本 Sunny row 868）：与 expert_5 同构，但两处差异——
+// skill_share 用的技能与兜底身份：市场详情查不到时（网络/接口变更）用这份常量上报，
+// 技能 id 是平台真实存在的条目（「润泽小馆·日报撰写」），编造 id 不计数。
+const skillShareSkillID = "skill_2097350077599879168"
+
+var skillShareFallback = upstream.MarketSkill{
+	SkillID:       skillShareSkillID,
+	DisplayNameZH: "润泽小馆·日报撰写",
+	Version:       "1.0.0",
+	Source:        "others",
+}
+
+// runSkillShare 完成 skill_share（分享一个技能给好友，活动截止 2026-11-18）。
+//
+// 判据（2026-11-14 客户端 5.9.5 asar 逆向 + 两账号实测）：analytics 事件
+// `skill_share_channel_action`，走 /v2/report 的桌面指纹通道。单发该事件即
+// 0/0 → 1/1 点亮并可领奖，不需要真实分享码、不需要好友接收，也不需要客户端
+// 升到 5.9.0（版本门只在前端做）。真实客户端的顺序是 detail_show →
+// entry_click → channel_action，这里照抄同序，便于上游后续加严时仍对得上。
+func runSkillShare(p *Panel, a *auth.Auth) (string, error) {
+	const code = "skill_share"
+	// 报名失败不阻塞：进度由行为事件点亮（与 runModelChat 同口径）。
+	if err := p.cfg.Upstream.AcceptTasks(a, []string{code}); err != nil {
+		log.Printf("panel: accept %s: %v（继续走事件链路）", code, err)
+	}
+	skill := skillShareFallback
+	// 用市场真实技能身份（分享事件带 skillName/skillSource，详情接口给的更权威）。
+	if list, err := p.cfg.Upstream.MarketSkillByIDs(a, []string{skillShareSkillID}); err != nil {
+		log.Printf("panel: 技能详情查询失败，用兜底身份: %v", err)
+	} else if len(list) > 0 && list[0].SkillID != "" {
+		skill = list[0]
+	}
+	if err := p.cfg.Upstream.ReportDesktopEvent(a, upstream.DesktopSkillShareEvents(skill, "link")...); err != nil {
+		return "", fmt.Errorf("分享事件上报: %w", err)
+	}
+	return fmt.Sprintf("已上报「%s」详情+分享事件（link 渠道）", skill.DisplayName()), nil
+}
+
+// runExpertLighthouse 完成 Expert_lighthouse（体验「腾讯轻量云」专家）。// 2026-09-12 判据（真实样本 Sunny row 868）：与 expert_5 同构，但两处差异——
 // chat 链的 agent_task_created 需带 has_expert:true + expert_id（我们默认 false），
 // expert_actual_use 的 mode 为 "LOCAL"（非 craft）。id 固定为轻量云专家
 // ex_2cvvUZQhDyeJ；requestId 必须是真实 chat 的服务端 id。紫川/人杰2 实测点亮。
